@@ -32,7 +32,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from rag.core.context import get_trace_id
+from rag.api.middleware.request_context import (
+    REQUEST_ID_HEADER,
+    REQUEST_ID_SCOPE_KEY,
+    TRACE_ID_HEADER,
+    TRACE_ID_SCOPE_KEY,
+)
+from rag.core.context import get_request_id, get_trace_id
 from rag.core.errors import (
     ConfigurationError,
     DependencyUnavailableError,
@@ -98,6 +104,19 @@ def status_for(exc: RAGError) -> int:
     return 500
 
 
+def correlation_ids(request: Request) -> tuple[str | None, str | None]:
+    """Resolve (request_id, trace_id) for this request.
+
+    Prefers the ASGI scope over the contextvars, because on the unhandled-error
+    path the contextvars have already been reset by the time this runs — see the
+    note in `rag.api.middleware.request_context`.
+    """
+    state: dict[str, Any] = request.scope.get("state") or {}
+    request_id = state.get(REQUEST_ID_SCOPE_KEY) or get_request_id()
+    trace_id = state.get(TRACE_ID_SCOPE_KEY) or get_trace_id()
+    return request_id, trace_id
+
+
 def problem_response(
     *,
     status: int,
@@ -105,8 +124,10 @@ def problem_response(
     detail: str,
     instance: str | None = None,
     extra: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    trace_id: str | None = None,
 ) -> JSONResponse:
-    """Build an RFC 9457 problem response with the ambient trace id attached."""
+    """Build an RFC 9457 problem response carrying the correlation ids."""
     body: dict[str, Any] = {
         "type": f"{PROBLEM_TYPE_BASE}{code}",
         "title": _TITLES.get(status, "Error"),
@@ -116,13 +137,27 @@ def problem_response(
     }
     if instance is not None:
         body["instance"] = instance
-    trace_id = get_trace_id()
     if trace_id is not None:
         body["trace_id"] = trace_id
     if extra:
         body.update(extra)
 
-    return JSONResponse(status_code=status, content=body, media_type=PROBLEM_CONTENT_TYPE)
+    # Set the ids on the response itself rather than relying on the middleware's
+    # `send` wrapper. ServerErrorMiddleware emits the 500 through the raw server
+    # `send`, bypassing that wrapper entirely, so a 500 would otherwise carry
+    # neither header.
+    headers: dict[str, str] = {}
+    if request_id is not None:
+        headers[REQUEST_ID_HEADER] = request_id
+    if trace_id is not None:
+        headers[TRACE_ID_HEADER] = trace_id
+
+    return JSONResponse(
+        status_code=status,
+        content=body,
+        media_type=PROBLEM_CONTENT_TYPE,
+        headers=headers,
+    )
 
 
 def register_exception_handlers(app: FastAPI, settings: Settings) -> None:
@@ -133,6 +168,8 @@ def register_exception_handlers(app: FastAPI, settings: Settings) -> None:
             raise exc
 
         status = status_for(exc)
+        request_id, trace_id = correlation_ids(request)
+
         # Ours (5xx) gets a stack trace; theirs (4xx) is an expected outcome.
         if status >= 500:
             _log.error("request.failed", code=exc.code, status_code=status, exc_info=exc)
@@ -145,6 +182,8 @@ def register_exception_handlers(app: FastAPI, settings: Settings) -> None:
             detail=exc.message,
             instance=request.url.path,
             extra={"errors": exc.details} if exc.details else None,
+            request_id=request_id,
+            trace_id=trace_id,
         )
 
     async def handle_validation_error(request: Request, exc: Exception) -> JSONResponse:
@@ -161,28 +200,43 @@ def register_exception_handlers(app: FastAPI, settings: Settings) -> None:
             }
             for error in exc.errors()
         ]
+        request_id, trace_id = correlation_ids(request)
         return problem_response(
             status=422,
             code="validation_error",
             detail="The request body or parameters failed validation.",
             instance=request.url.path,
             extra={"errors": errors},
+            request_id=request_id,
+            trace_id=trace_id,
         )
 
     async def handle_http_exception(request: Request, exc: Exception) -> JSONResponse:
         if not isinstance(exc, StarletteHTTPException):  # pragma: no cover
             raise exc
         # Covers framework-generated 404/405 so *every* response shape matches.
+        request_id, trace_id = correlation_ids(request)
         return problem_response(
             status=exc.status_code,
             code=_TITLES.get(exc.status_code, "error").lower().replace(" ", "_"),
             detail=str(exc.detail),
             instance=request.url.path,
+            request_id=request_id,
+            trace_id=trace_id,
         )
 
     async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
         # Anything reaching here is a bug. Log everything; disclose nothing.
-        _log.error("request.unhandled_exception", path=request.url.path, exc_info=exc)
+        # The ids are passed explicitly: this handler runs *after* the request
+        # context has been unbound, so the logging processor cannot supply them.
+        request_id, trace_id = correlation_ids(request)
+        _log.error(
+            "request.unhandled_exception",
+            path=request.url.path,
+            request_id=request_id,
+            trace_id=trace_id,
+            exc_info=exc,
+        )
         detail = (
             f"{type(exc).__name__}: {exc}"
             if settings.expose_error_details
@@ -193,6 +247,8 @@ def register_exception_handlers(app: FastAPI, settings: Settings) -> None:
             code="internal_error",
             detail=detail,
             instance=request.url.path,
+            request_id=request_id,
+            trace_id=trace_id,
         )
 
     app.add_exception_handler(RAGError, handle_rag_error)

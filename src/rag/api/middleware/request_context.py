@@ -43,6 +43,10 @@ if TYPE_CHECKING:
 REQUEST_ID_HEADER = "x-request-id"
 TRACE_ID_HEADER = "x-trace-id"
 
+# Keys under `scope["state"]`, readable as `request.state.<key>`.
+REQUEST_ID_SCOPE_KEY = "request_id"
+TRACE_ID_SCOPE_KEY = "trace_id"
+
 # Conservative: alphanumerics plus a few separators used by common trace formats.
 _SAFE_ID_PATTERN = re.compile(r"\A[A-Za-z0-9._:\-]{1,128}\Z")
 
@@ -73,6 +77,19 @@ class RequestContextMiddleware:
         trace_id = _accept_or_generate(headers.get(TRACE_ID_HEADER)) or request_id
 
         tokens = bind_request_context(request_id=request_id, trace_id=trace_id)
+
+        # Also stash the ids on the ASGI scope, reachable downstream as
+        # `request.state.trace_id`.
+        #
+        # This is not redundancy for its own sake. Starlette installs
+        # ServerErrorMiddleware as the OUTERMOST layer, outside this one. When an
+        # unhandled exception propagates, our `finally` below resets the
+        # contextvars *before* that middleware builds the 500 response — so the
+        # single response a user is most likely to report would be the only one
+        # without a trace id. The scope outlives the contextvars.
+        scope.setdefault("state", {})
+        scope["state"][REQUEST_ID_SCOPE_KEY] = request_id
+        scope["state"][TRACE_ID_SCOPE_KEY] = trace_id
 
         async def send_with_ids(message: Message) -> None:
             if message["type"] == "http.response.start":

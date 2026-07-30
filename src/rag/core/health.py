@@ -105,7 +105,9 @@ class HealthRegistry:
         except TimeoutError:
             healthy = False
             detail = f"timed out after {registered.timeout_seconds:g}s"
-        except Exception as exc:  # noqa: BLE001 - a probe must never propagate
+        # Deliberately broad: a health probe reports failures, it never raises
+        # them. One badly-behaved check must not take down the whole endpoint.
+        except Exception as exc:
             healthy = False
             detail = f"{type(exc).__name__}: {exc}"
 

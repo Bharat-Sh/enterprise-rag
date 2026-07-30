@@ -88,9 +88,7 @@ async def ready(response: Response, registry: HealthRegistryDep) -> ReadinessRes
 
     # Set the status explicitly rather than raising: the body is useful in both
     # cases, and an operator debugging a failing probe wants the detail.
-    response.status_code = (
-        status.HTTP_200_OK if ready_now else status.HTTP_503_SERVICE_UNAVAILABLE
-    )
+    response.status_code = status.HTTP_200_OK if ready_now else status.HTTP_503_SERVICE_UNAVAILABLE
 
     return ReadinessResponse(
         ready=ready_now,

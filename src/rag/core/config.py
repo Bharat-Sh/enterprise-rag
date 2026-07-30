@@ -28,7 +28,9 @@ from functools import lru_cache
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_DEV_DEFAULT_SECRET = "rag"
+# Not a credential we use — a sentinel the production validator compares against
+# in order to *reject* it. Bandit cannot tell the difference.
+_DEV_DEFAULT_SECRET = "rag"  # noqa: S105
 
 
 class Environment(StrEnum):

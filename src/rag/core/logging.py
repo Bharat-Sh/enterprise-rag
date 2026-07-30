@@ -89,14 +89,10 @@ def _redact_sensitive(
     return event_dict
 
 
-def _make_service_metadata(
-    service_name: str, version: str, environment: str
-) -> Processor:
+def _make_service_metadata(service_name: str, version: str, environment: str) -> Processor:
     """Build a processor stamping static service identity onto every event."""
 
-    def processor(
-        _logger: WrappedLogger, _method_name: str, event_dict: EventDict
-    ) -> EventDict:
+    def processor(_logger: WrappedLogger, _method_name: str, event_dict: EventDict) -> EventDict:
         event_dict.setdefault("service", service_name)
         event_dict.setdefault("version", version)
         event_dict.setdefault("env", environment)

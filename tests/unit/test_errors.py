@@ -136,11 +136,19 @@ class TestProblemResponses:
         response = await failing_client.get("/boom/unhandled")
 
         assert response.status_code == 500
-        body = response.json()
-        assert body["code"] == "internal_error"
-        # Local/dev may include the exception text; the internal message must
-        # never leak verbatim without the environment opting in.
-        assert "trace_id" in body
+        assert response.json()["code"] == "internal_error"
+
+    async def test_the_500_path_still_carries_correlation_ids(self, failing_client) -> None:
+        # Regression guard. Starlette's ServerErrorMiddleware sits outside our
+        # RequestContextMiddleware, so by the time it builds this response the
+        # contextvars have been reset and its `send` bypasses our header
+        # wrapper. Without reading the ids off the ASGI scope, the one response
+        # a user is most likely to report is the only one with nothing to quote.
+        response = await failing_client.get("/boom/unhandled")
+
+        assert response.headers["x-trace-id"]
+        assert response.headers["x-request-id"]
+        assert response.json()["trace_id"] == response.headers["x-trace-id"]
 
     async def test_routing_404_uses_the_same_envelope(self, failing_client) -> None:
         # Consistency matters: a client should not need two error parsers.
@@ -175,4 +183,6 @@ class TestProductionDisclosure:
 
         assert response.status_code == 500
         assert "secret internal detail" not in response.text
-        assert "trace_id" in response.json()
+        assert "RuntimeError" not in response.text
+        # Still traceable internally even though nothing is disclosed outward.
+        assert response.json()["trace_id"] == response.headers["x-trace-id"]

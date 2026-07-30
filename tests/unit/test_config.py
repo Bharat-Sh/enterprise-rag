@@ -11,7 +11,7 @@ from rag.core.config import Environment, LogFormat, Settings, get_settings
 
 # A password that satisfies the production check, so tests can exercise *other*
 # production rules without tripping the default-credential guard first.
-SAFE_PASSWORD = "not-the-development-default"
+SAFE_PASSWORD = "not-the-development-default"  # noqa: S105 - test fixture, not a real secret
 
 
 def _make(**overrides: Any) -> Settings:
