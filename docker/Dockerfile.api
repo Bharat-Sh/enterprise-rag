@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1.7
+#
+# Multi-stage build for the API (and, later, the ingestion worker — same image,
+# different CMD). The model service gets its own CUDA-based Dockerfile in M4;
+# this image stays CPU-only and small.
+
+# --------------------------------------------------------------------------
+# Stage 1 — builder: resolve dependencies into a self-contained virtualenv.
+# --------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS builder
+
+# uv resolves and installs 10-100x faster than pip. Copying the static binary
+# from the official image avoids a bootstrap pip install.
+COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /usr/local/bin/uv
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /build
+RUN uv venv "$VIRTUAL_ENV"
+
+# Dependency layer. We copy only the manifest and stub out the package so this
+# layer's cache key depends on pyproject.toml alone — editing application code
+# then rebuilds in seconds instead of re-resolving the dependency tree.
+COPY pyproject.toml README.md ./
+RUN mkdir -p src/rag && touch src/rag/__init__.py
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install .
+
+# Source layer. --no-deps because the dependency set is already installed above.
+# TODO(M13): commit a uv.lock and switch to `uv sync --frozen` for byte-for-byte
+# reproducible builds. Acceptable to defer while the dependency set is churning.
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps --force-reinstall .
+
+# --------------------------------------------------------------------------
+# Stage 2 — runtime: the venv only. No compilers, no uv, no build context.
+# --------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONFAULTHANDLER=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# Run as a non-root user. A container escape should not begin with root.
+RUN groupadd --system --gid 1001 rag \
+    && useradd --system --uid 1001 --gid rag --create-home --shell /usr/sbin/nologin rag
+
+COPY --from=builder --chown=rag:rag /opt/venv /opt/venv
+
+WORKDIR /app
+USER rag
+
+EXPOSE 8000
+
+# Docker's healthcheck can restart the container, so it must probe LIVENESS
+# (/health), never readiness. Pointing this at /ready would restart every API
+# container during a brief Postgres blip — turning a degradation into an outage.
+# Uses urllib because the slim image ships no curl or wget.
+HEALTHCHECK --interval=15s --timeout=3s --start-period=15s --retries=3 \
+    CMD python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+
+# One process per container; scale with replicas, not --workers. Keeps signal
+# handling, logging, and per-container resource limits comprehensible.
+CMD ["uvicorn", "rag.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

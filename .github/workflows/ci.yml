@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  quality:
+    name: Lint, types, architecture, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      # Gate 1 — style. `ruff format --check` fails on unformatted code rather
+      # than reformatting it, so formatting never lands as a surprise diff.
+      - name: Lint
+        run: |
+          uv run ruff check --output-format=github .
+          uv run ruff format --check .
+
+      # Gate 2 — types.
+      - name: Type check
+        run: uv run mypy
+
+      # Gate 3 — architecture. The hexagonal boundaries from docs/adr/0003 are
+      # checked by a machine; a rule enforced only by code review is a comment.
+      - name: Architecture contracts
+        run: uv run lint-imports
+
+      # Gate 4 — behaviour.
+      - name: Tests
+        run: uv run pytest --cov=rag --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  image:
+    name: Build API image
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          push: false
+          load: true
+          tags: enterprise-rag-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Proves the image actually starts and serves liveness, not just that it
+      # compiles. A green build of a container that crashes on boot is worthless.
+      - name: Smoke test the image
+        run: |
+          docker run -d --name rag-api -p 8000:8000 \
+            -e RAG_ENVIRONMENT=local enterprise-rag-api:ci
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health > /dev/null; then
+              echo "API is live"
+              curl -fsS http://localhost:8000/health
+              docker rm -f rag-api
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to become live within 30s"
+          docker logs rag-api
+          docker rm -f rag-api
+          exit 1

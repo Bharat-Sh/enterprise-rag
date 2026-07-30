@@ -1,0 +1,155 @@
+[project]
+name = "enterprise-rag"
+version = "0.1.0"
+description = "Production-grade multi-tenant Enterprise RAG platform"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "structlog>=24.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "httpx>=0.28",
+    "import-linter>=2.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rag"]
+
+
+# ---------------------------------------------------------------------------
+# Ruff — linter AND formatter. We deliberately do not use Black: `ruff format`
+# is a drop-in replacement, and running both means two tools arguing over the
+# same file.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "F",     # pyflakes
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "SIM",   # flake8-simplify
+    "ASYNC", # flake8-async  (blocking calls in async defs — critical for us)
+    "S",     # flake8-bandit (security)
+    "ANN",   # flake8-annotations (type hints everywhere)
+    "RUF",   # ruff-specific
+]
+ignore = [
+    "ANN401", # `Any` is legitimate in a few generic seams
+    "S104",   # binding 0.0.0.0 is correct inside a container
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "ANN001", "ANN201", "ANN202"] # assert + fixture ergonomics
+
+[tool.ruff.lint.isort]
+known-first-party = ["rag"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+
+# ---------------------------------------------------------------------------
+# mypy — strict everywhere. Relaxed only for tests, where fixture plumbing
+# makes full annotation noise outweigh the benefit.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+packages = ["rag"]
+strict = true
+warn_unreachable = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "integration: requires real backing services (docker compose up)",
+    "e2e: full end-to-end flow",
+]
+
+[tool.coverage.run]
+source = ["src/rag"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+
+# ---------------------------------------------------------------------------
+# import-linter — the architecture rules from docs/adr/0003, enforced by CI.
+# An architectural boundary that isn't checked by a machine is a comment.
+#
+# `forbidden_modules` lists only packages that are actually installed; it grows
+# as we add adapters (sqlalchemy in M1, qdrant_client in M5, anthropic in M8).
+# ---------------------------------------------------------------------------
+[tool.importlinter]
+root_package = "rag"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Domain is pure — no infrastructure, no delivery, no frameworks"
+type = "forbidden"
+source_modules = ["rag.domain"]
+forbidden_modules = [
+    "rag.api",
+    "rag.adapters",
+    "rag.db",
+    "rag.services",
+    "fastapi",
+    "starlette",
+]
+
+[[tool.importlinter.contracts]]
+name = "Services depend on ports, never on concrete adapters"
+type = "forbidden"
+source_modules = ["rag.services"]
+forbidden_modules = ["rag.adapters", "rag.api", "rag.db"]
+
+[[tool.importlinter.contracts]]
+name = "Core is the base layer and depends on nothing of ours"
+type = "forbidden"
+source_modules = ["rag.core"]
+forbidden_modules = [
+    "rag.api",
+    "rag.adapters",
+    "rag.db",
+    "rag.services",
+    "rag.domain",
+]
