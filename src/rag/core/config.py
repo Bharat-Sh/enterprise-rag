@@ -150,6 +150,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         frozen=True,
+        # Pydantic reserves the `model_` prefix for its own attributes and warns
+        # on any field that starts with it. We legitimately have a
+        # `model_service` group (the ML model server), so the guard is disabled.
+        protected_namespaces=(),
     )
 
     environment: Environment = Environment.LOCAL

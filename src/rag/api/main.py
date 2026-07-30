@@ -106,6 +106,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-# Entry point for `uvicorn rag.api.main:app`. Kept at the bottom so importing
-# anything else from this module does not build an application as a side effect.
-app = create_app()
+# NOTE: there is deliberately no module-level `app` here. Building one at import
+# time would mean that importing `create_app` (as the test suite does) reads the
+# ambient environment and the local .env, destroying test hermeticity. The
+# instantiation lives in `rag.api.asgi` instead — see that module's docstring.

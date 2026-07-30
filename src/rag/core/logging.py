@@ -28,12 +28,11 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from rag.core.config import LogFormat
 from rag.core.context import current_context
 
 if TYPE_CHECKING:
     from structlog.typing import EventDict, Processor, WrappedLogger
-
-    from rag.core.config import LogFormat
 
 __all__ = ["configure_logging", "get_logger"]
 
@@ -119,8 +118,6 @@ def configure_logging(
     Idempotent: safe to call more than once (tests do), because it clears the
     root handler list before installing ours.
     """
-    from rag.core.config import LogFormat as _LogFormat  # noqa: PLC0415 (avoid cycle)
-
     # Applied to events from structlog loggers AND from stdlib loggers, so a
     # SQLAlchemy warning carries the same trace id as our own events.
     shared_processors: list[Processor] = [
@@ -135,7 +132,7 @@ def configure_logging(
 
     renderer: Processor
     final_processors: list[Processor]
-    if log_format is _LogFormat.JSON:
+    if log_format is LogFormat.JSON:
         renderer = structlog.processors.JSONRenderer()
         final_processors = [
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,

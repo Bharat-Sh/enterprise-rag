@@ -97,7 +97,7 @@ uv pip install -e ".[dev]"
 docker compose -f docker/compose.yml up -d postgres redis qdrant
 
 # The API
-uv run uvicorn rag.api.main:app --reload
+uv run uvicorn rag.api.asgi:app --reload
 ```
 
 Then:

@@ -14,7 +14,7 @@ install: ## Create the venv and install runtime + dev dependencies
 	uv pip install -e ".[dev]"
 
 dev: ## Run the API with auto-reload
-	uv run uvicorn rag.api.main:app --reload --host 0.0.0.0 --port 8000
+	uv run uvicorn rag.api.asgi:app --reload --host 0.0.0.0 --port 8000
 
 lint: ## Check style without modifying files
 	uv run ruff check .

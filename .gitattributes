@@ -1,0 +1,10 @@
+# Normalise line endings. Without this, developing on Windows commits CRLF into
+# files that are later executed inside Linux containers — a Dockerfile or shell
+# script with CRLF fails with errors that look nothing like the actual cause.
+* text=auto eol=lf
+
+# Binary assets that must never be touched.
+*.png binary
+*.jpg binary
+*.pdf binary
+*.ico binary

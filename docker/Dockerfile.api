@@ -67,4 +67,4 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=15s --retries=3 \
 
 # One process per container; scale with replicas, not --workers. Keeps signal
 # handling, logging, and per-container resource limits comprehensible.
-CMD ["uvicorn", "rag.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "rag.api.asgi:app", "--host", "0.0.0.0", "--port", "8000"]
