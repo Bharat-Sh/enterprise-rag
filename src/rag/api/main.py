@@ -28,6 +28,7 @@ from rag.api.v1.routers import health
 from rag.core.config import Settings, get_settings
 from rag.core.health import HealthRegistry
 from rag.core.logging import configure_logging, get_logger
+from rag.db.session import create_engine, create_session_factory, ping
 
 _log = get_logger(__name__)
 
@@ -56,12 +57,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.health = HealthRegistry()
 
-    _log.info("startup.complete", health_checks=list(app.state.health.names))
+    # Creating the engine opens no sockets — the pool connects lazily on first
+    # use. So a database that is down delays readiness rather than preventing
+    # the process from starting, which is what lets the pod report *why* it is
+    # not ready instead of crash-looping silently.
+    engine = create_engine(settings)
+    session_factory = create_session_factory(engine)
+    app.state.db_engine = engine
+    app.state.db_session_factory = session_factory
+
+    async def check_postgres() -> None:
+        async with session_factory() as session:
+            await ping(session)
+
+    app.state.health.register("postgres", check_postgres, timeout_seconds=2.0, required=True)
+
+    _log.info(
+        "startup.complete",
+        health_checks=list(app.state.health.names),
+        database=settings.database.safe_dsn,
+    )
     try:
         yield
     finally:
         # Runs on clean shutdown and on startup failure alike, so resource
         # teardown belongs here rather than after `yield` unguarded.
+        await engine.dispose()
         _log.info("shutdown.complete")
 
 

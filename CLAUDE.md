@@ -94,43 +94,48 @@ uv run pytest                uv run uvicorn rag.api.asgi:app --reload
 
 ## Current state
 
-**M0 complete.** Configuration, structured logging, request context, error
-hierarchy, liveness/readiness, Docker definitions, CI. No business logic yet.
+**M0 and M1 complete.** Config, logging, request context, errors,
+liveness/readiness, Docker, CI (M0); schema, migrations, RLS, repositories,
+unit of work, job queue (M1).
 
-Gate is green: ruff, `ruff format`, mypy strict, 3/3 import contracts, 63 tests.
-Verified by boot smoke test (`/health` 200, `/ready` 200, unknown route 404 as
-`application/problem+json`).
+Gate is green: ruff, `ruff format`, mypy strict, 3/3 import contracts,
+**169 tests** (unit + integration against a real Postgres).
 
-Three commits on `main`. **No git remote — nothing has been pushed to GitHub
-yet.** Commits are authored as `122530216+Bharat-Sh@users.noreply.github.com`;
-keep it that way.
+**No git remote — nothing has been pushed to GitHub yet.** Commits are authored
+as `122530216+Bharat-Sh@users.noreply.github.com`; keep it that way.
 
-One M0 subtlety worth not re-discovering: Starlette installs
-`ServerErrorMiddleware` outside all custom middleware, so on the unhandled-error
-path the request contextvars are already unbound and its response bypasses our
-`send` wrapper. Correlation ids are therefore read from `scope["state"]` and set
-directly on the problem response. See `rag/api/errors.py::correlation_ids` and
-the regression test in `tests/unit/test_errors.py`.
+### Subtleties worth not re-discovering
 
-## Next: M1 — data model and persistence
+- **Correlation ids on the 500 path.** Starlette installs `ServerErrorMiddleware`
+  outside all custom middleware, so on the unhandled-error path the contextvars
+  are already unbound and its response bypasses our `send` wrapper. Ids are read
+  from `scope["state"]` and set directly on the problem response. See
+  `rag/api/errors.py::correlation_ids`.
+- **`FORCE ROW LEVEL SECURITY` is mandatory.** Table owners bypass RLS by
+  default and the app owns its tables. Without FORCE every policy is inert while
+  still appearing in `pg_policies`. Asserted by test.
+- **`SET LOCAL`, never `SET`.** Transaction-scoped, so a pooled connection never
+  carries one tenant's scope into the next request. Consequence:
+  `UnitOfWork.commit()` must reapply the scope, because commit discards it.
+- **`WITH CHECK` as well as `USING`.** Otherwise a session scoped to tenant A can
+  insert rows stamped tenant B.
+- **`claim()` re-reads through the ORM** rather than parsing `RETURNING` rows:
+  raw SQL has no result-type information, so JSONB payloads come back as text.
+- **Two distinct conflict errors.** `InvalidStateTransitionError` means the move
+  is impossible from any state (do not retry). `ConcurrentModificationError`
+  means it arrived second (re-read and retry). Both 409; different client
+  behaviour, so they need different codes.
 
-Tenants, users, roles, documents, chunks, jobs. Async SQLAlchemy 2.x with a
-unit-of-work, Alembic migrations, repositories behind ports.
+## Next: M2 — authentication and RBAC
 
-Two design decisions to settle *before* writing models, both with real
-consequences downstream:
+Password and API-key auth, JWT with asymmetric keys and OIDC-shaped claims,
+tenant-scoped request dependencies, per-tenant rate limiting.
 
-1. **Tenant isolation.** A `tenant_id` column every query must remember to
-   filter, versus Postgres Row-Level Security where the database refuses to
-   return other tenants' rows even when the application forgets. RLS costs
-   setup and some query planning predictability; forgetting a `WHERE` clause
-   once is a breach.
-2. **ACL shape.** Document permissions must be expressible as a **Qdrant payload
-   filter** in M5. Modelling them as a normalised join table only Postgres can
-   evaluate forces M5 into post-retrieval filtering, which corrupts recall *and*
-   means the rows were read before the check. Design the schema backwards from
-   that constraint.
+The wiring that matters: `get_unit_of_work` in `rag/api/deps.py` must call
+`scope_to_tenant()` with the tenant from the **verified token** before any
+handler runs — never from a request body, query parameter, or header. Until then
+the RLS scope is bound only by tests.
 
-Chunks carry `embedding_model` and `embedding_version` from the start, so the
-M4/M5 embedding-migration path (re-embed into a new named vector, backfill, cut
-over) stays open.
+Cross-tenant lookups raise `NotFoundError`, never `PermissionDeniedError`:
+returning 403 for a resource in another tenant confirms it exists, which is an
+enumeration oracle.

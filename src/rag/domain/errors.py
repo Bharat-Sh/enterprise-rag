@@ -93,6 +93,52 @@ class QuotaExceededError(DomainError):
     default_message: ClassVar[str] = "A usage quota has been exceeded."
 
 
+class ConcurrentModificationError(DomainError):
+    """The entity changed between the caller's read and its write.
+
+    Deliberately distinct from `InvalidStateTransitionError`. That one means the
+    request was wrong — a move the state machine forbids from any starting
+    point. This one means the request was fine but arrived second: the move may
+    be perfectly legal, it simply started from a state that no longer holds.
+
+    The distinction is not academic. A client seeing this should re-read and
+    retry, and a retry will usually succeed. A client seeing an invalid
+    transition should not retry at all, because it will fail identically for
+    ever. Collapsing them into one code makes correct client behaviour
+    impossible to write.
+    """
+
+    code: ClassVar[str] = "concurrent_modification"
+    default_message: ClassVar[str] = "The resource was modified concurrently."
+
+    def __init__(
+        self,
+        entity: str,
+        *,
+        expected: str,
+        actual: str,
+        identifier: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        merged: dict[str, Any] = {
+            "entity": entity,
+            "expected_state": expected,
+            "actual_state": actual,
+            "hint": "re-read the resource and retry",
+        }
+        if identifier is not None:
+            merged["id"] = identifier
+        merged.update(details or {})
+        super().__init__(
+            f"{entity} was expected in state {expected!r} but is now {actual!r}; "
+            f"another operation modified it first.",
+            details=merged,
+        )
+        self.entity = entity
+        self.expected = expected
+        self.actual = actual
+
+
 class InvalidStateTransitionError(DomainError):
     """An entity was asked to move to a state it cannot reach from its current one.
 

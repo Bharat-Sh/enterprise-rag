@@ -48,6 +48,7 @@ from rag.core.errors import (
 from rag.core.logging import get_logger
 from rag.domain.errors import (
     AlreadyExistsError,
+    ConcurrentModificationError,
     DomainError,
     InvalidInputError,
     InvalidStateTransitionError,
@@ -72,6 +73,7 @@ _STATUS_BY_ERROR: dict[type[RAGError], int] = {
     NotFoundError: 404,
     AlreadyExistsError: 409,
     InvalidStateTransitionError: 409,
+    ConcurrentModificationError: 409,
     QuotaExceededError: 429,
     DomainError: 400,
     DependencyUnavailableError: 503,

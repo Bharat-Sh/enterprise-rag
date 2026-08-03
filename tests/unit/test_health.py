@@ -109,6 +109,23 @@ class TestReadinessAggregation:
         assert is_ready(components) is True
 
 
+@pytest.fixture
+def health_registry(client, app) -> HealthRegistry:
+    """Swap the application's real dependency checks for an empty registry.
+
+    From M1, `lifespan` registers a live Postgres check. These tests exercise
+    the *endpoint contract*, not the wiring, and must not require a database to
+    be running — otherwise the unit suite silently becomes an integration suite
+    and stops being runnable anywhere.
+
+    Depends on `client` so this runs after the lifespan has populated the real
+    registry, replacing it rather than being overwritten by it.
+    """
+    registry = HealthRegistry()
+    app.state.health = registry
+    return registry
+
+
 class TestLivenessEndpoint:
     async def test_liveness_returns_service_identity(self, client, settings) -> None:
         response = await client.get("/health")
@@ -119,31 +136,31 @@ class TestLivenessEndpoint:
         assert body["service"] == settings.service_name
         assert body["environment"] == "local"
 
-    async def test_liveness_does_not_consult_dependencies(self, client, app) -> None:
+    async def test_liveness_does_not_consult_dependencies(self, client, health_registry) -> None:
         # The whole point of the split: a broken dependency must not make the
         # orchestrator restart an otherwise-healthy process.
-        app.state.health.register("postgres", _broken)
+        health_registry.register("postgres", _broken)
 
         assert (await client.get("/health")).status_code == 200
 
 
 class TestReadinessEndpoint:
-    async def test_ready_with_no_registered_checks(self, client) -> None:
+    async def test_ready_with_no_registered_checks(self, client, health_registry) -> None:
         response = await client.get("/ready")
 
         assert response.status_code == 200
         assert response.json() == {"ready": True, "components": []}
 
-    async def test_ready_when_all_required_checks_pass(self, client, app) -> None:
-        app.state.health.register("postgres", _healthy)
+    async def test_ready_when_all_required_checks_pass(self, client, health_registry) -> None:
+        health_registry.register("postgres", _healthy)
 
         response = await client.get("/ready")
 
         assert response.status_code == 200
         assert response.json()["ready"] is True
 
-    async def test_not_ready_when_a_required_check_fails(self, client, app) -> None:
-        app.state.health.register("postgres", _broken)
+    async def test_not_ready_when_a_required_check_fails(self, client, health_registry) -> None:
+        health_registry.register("postgres", _broken)
 
         response = await client.get("/ready")
 
@@ -153,9 +170,9 @@ class TestReadinessEndpoint:
         assert body["components"][0]["name"] == "postgres"
         assert body["components"][0]["healthy"] is False
 
-    async def test_ready_despite_a_failing_optional_check(self, client, app) -> None:
-        app.state.health.register("postgres", _healthy)
-        app.state.health.register("redis", _broken, required=False)
+    async def test_ready_despite_a_failing_optional_check(self, client, health_registry) -> None:
+        health_registry.register("postgres", _healthy)
+        health_registry.register("redis", _broken, required=False)
 
         response = await client.get("/ready")
 
@@ -164,6 +181,12 @@ class TestReadinessEndpoint:
         assert body["ready"] is True
         unhealthy = [c for c in body["components"] if not c["healthy"]]
         assert [c["name"] for c in unhealthy] == ["redis"]
+
+    async def test_the_application_wires_a_real_postgres_check(self, client, app) -> None:
+        # Complements the tests above, which deliberately isolate the endpoint.
+        # Something still has to assert the production wiring exists, or an
+        # accidentally-deleted `register` call would go unnoticed.
+        assert "postgres" in app.state.health.names
 
 
 class TestRequestContextHeaders:

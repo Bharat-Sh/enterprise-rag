@@ -4,8 +4,9 @@ A multi-tenant, production-shaped retrieval-augmented generation platform:
 documents in, grounded and cited answers out, with access control, evaluation,
 and observability treated as features rather than afterthoughts.
 
-> **Status: M0 — Foundations.** The service boots, logs, fails correctly, and is
-> containerised. It has no business logic yet. Milestones are listed below.
+> **Status: M1 — Data model and persistence.** The service boots, logs, fails
+> correctly, and now has a tenant-isolated schema with migrations, repositories,
+> a unit of work, and a job queue. Retrieval arrives in M5. Milestones below.
 
 ---
 
@@ -25,6 +26,30 @@ a RAG system deployable inside a company are the parts most demos skip:
 
 Architectural decisions — including the ones where the obvious alternative was
 rejected, and why — live in [`docs/adr/`](docs/adr/).
+
+### Data model
+
+```
+tenants ─┬─ users ──── group_members ──── groups
+         ├─ collections ── documents ─┬─ chunks
+         │                            └─ document_permissions
+         └─ jobs   (no RLS — workers poll cross-tenant by design)
+
+documents.status:  UPLOADED → QUEUED → PARSING → CHUNKING → EMBEDDING
+                            → INDEXING → READY
+                   any → FAILED · READY → REINDEXING / DELETING → DELETED
+```
+
+Every tenant-scoped table carries a row-level security policy that reads
+`current_setting('rag.tenant_id')`, bound per transaction with `SET LOCAL`. An
+unscoped session sees **zero** rows rather than every row — the failure mode that
+justified the complexity. See [ADR-0005](docs/adr/0005-row-level-security.md).
+
+Within a tenant, document permissions are a flat `text[]` of principal tokens
+(`user:…`, `group:…`, `role:…`, `tenant:…`) matched against the caller's set with
+the GIN-indexed array-overlap operator `&&` — the exact semantics of Qdrant's
+`match_any`, so M5 enforces access with the same decision procedure rather than a
+similar-looking reimplementation. See [ADR-0006](docs/adr/0006-acl-projection.md).
 
 ---
 
@@ -180,8 +205,8 @@ caching but not correctness).
 | | Milestone | State |
 |---|---|---|
 | M0 | Foundations — config, logging, errors, health, Docker, CI | **done** |
-| M1 | Data model — tenants, documents, chunks, jobs; migrations | next |
-| M2 | Auth & RBAC — JWT, roles, tenant scoping, rate limiting | |
+| M1 | Data model — tenants, documents, chunks, jobs; RLS; migrations | **done** |
+| M2 | Auth & RBAC — JWT, roles, tenant scoping, rate limiting | next |
 | M3 | Ingestion — upload, job queue, parsing, chunking, state machine | |
 | M4 | Model service — BGE-M3 + reranker on GPU, batching | |
 | M5 | Dense retrieval — Qdrant, ACL pre-filter, `/search` | |

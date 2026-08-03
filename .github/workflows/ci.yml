@@ -16,6 +16,25 @@ jobs:
   quality:
     name: Lint, types, architecture, tests
     runs-on: ubuntu-latest
+
+    # Integration tests auto-skip when no database is reachable, so without this
+    # they would pass by not running — the worst kind of green build. The RLS
+    # and SKIP LOCKED tests are the ones most worth having in CI.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: rag
+          POSTGRES_PASSWORD: rag
+          POSTGRES_DB: rag_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rag -d rag_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -49,9 +68,52 @@ jobs:
       - name: Architecture contracts
         run: uv run lint-imports
 
-      # Gate 4 — behaviour.
+      # Gate 4 — migrations must be replayable, not one-way.
+      #
+      # An upgrade/downgrade/upgrade cycle. The first version of the initial
+      # migration passed a plain `upgrade` but failed the second one:
+      # autogenerate drops tables without dropping the Postgres ENUM types they
+      # created, so re-applying died on DuplicateObjectError. A schema that
+      # cannot be rebuilt from zero is a schema you cannot restore.
+      - name: Migration round-trip
+        env:
+          RAG_MIGRATION_DSN: postgresql+asyncpg://rag:rag@127.0.0.1:5432/rag_test
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+          uv run alembic current
+
+      # Gate 5 — behaviour. Unit and integration together; the integration tests
+      # run against the service container above.
       - name: Tests
+        env:
+          RAG_TEST_DB_HOST: 127.0.0.1
+          RAG_TEST_DB_PORT: "5432"
+          RAG_TEST_DB_USER: rag
+          RAG_TEST_DB_PASSWORD: rag
+          RAG_TEST_DB_NAME: rag_test
         run: uv run pytest --cov=rag --cov-report=term-missing --cov-report=xml
+
+      # Guards against the integration suite silently skipping in CI, which
+      # would turn a security regression into a passing build.
+      - name: Assert integration tests actually ran
+        env:
+          RAG_TEST_DB_HOST: 127.0.0.1
+          RAG_TEST_DB_PORT: "5432"
+          RAG_TEST_DB_USER: rag
+          RAG_TEST_DB_PASSWORD: rag
+          RAG_TEST_DB_NAME: rag_test
+        run: |
+          count=$(uv run pytest tests/integration -q --collect-only 2>/dev/null | tail -1)
+          echo "collected: $count"
+          uv run pytest tests/integration -q --no-header -p no:cacheprovider \
+            | tee /tmp/integration.log
+          grep -qE '[0-9]+ passed' /tmp/integration.log
+          if grep -qE '[0-9]+ skipped' /tmp/integration.log; then
+            echo "::error::Integration tests were skipped — the database was unreachable."
+            exit 1
+          fi
 
       - name: Upload coverage
         if: always()
