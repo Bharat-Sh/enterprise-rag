@@ -101,8 +101,12 @@ unit of work, job queue (M1).
 Gate is green: ruff, `ruff format`, mypy strict, 3/3 import contracts,
 **169 tests** (unit + integration against a real Postgres).
 
-**No git remote — nothing has been pushed to GitHub yet.** Commits are authored
-as `122530216+Bharat-Sh@users.noreply.github.com`; keep it that way.
+Commits are authored as `122530216+Bharat-Sh@users.noreply.github.com` — keep it
+that way; the repo is intended to be public eventually and a real address in git
+history is permanent once published.
+
+Check `git remote -v` before assuming anything about the remote. The repo is
+`Bharat-Sh/enterprise-rag`, private for now.
 
 ### Subtleties worth not re-discovering
 
