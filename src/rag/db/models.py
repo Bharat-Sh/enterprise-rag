@@ -318,7 +318,14 @@ class DocumentORM(UUIDPrimaryKeyMixin, TenantScopedMixin, TimestampMixin, Base):
     )
 
     title: Mapped[str] = mapped_column(String(512), nullable=False)
+    #: Where the bytes came *from* — `upload://original-name.pdf` today, an
+    #: http(s) URL once there is a connector. Provenance, for a human.
     source_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Where the bytes are *now*, in the blob store (docs/adr/0009). Distinct
+    #: from `source_uri` because they answer different questions and diverge
+    #: immediately: two documents can share a source and never a blob key, and
+    #: the key's layout is owned by whichever adapter is configured.
+    blob_key: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
     #: SHA-256 of the raw bytes, hex encoded.
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -351,6 +358,7 @@ class DocumentORM(UUIDPrimaryKeyMixin, TenantScopedMixin, TimestampMixin, Base):
             collection_id=self.collection_id,
             title=self.title,
             source_uri=self.source_uri,
+            blob_key=self.blob_key,
             content_hash=self.content_hash,
             mime_type=self.mime_type,
             size_bytes=self.size_bytes,

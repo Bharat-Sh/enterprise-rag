@@ -22,6 +22,10 @@ dependencies = [
     # argon2-cffi directly rather than passlib, which is unmaintained and whose
     # bcrypt backend broke outright against bcrypt>=4.1.
     "argon2-cffi>=23.1",
+    # Required by FastAPI to accept multipart/form-data uploads. The M3a text
+    # path is otherwise stdlib; the document parsers and their dependencies
+    # (pypdf, python-docx, selectolax, defusedxml) arrive with M3b.
+    "python-multipart>=0.0.20",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +43,10 @@ dev = [
 # Bootstrap and break-glass only. A fresh deployment has no tenant and no user,
 # and every endpoint requires a credential; something has to create the first one.
 rag-admin = "rag.cli:main"
+# The ingestion worker. A separate process from the API on purpose: parsing is
+# blocking CPU work, and running it in a request handler would stall every
+# concurrent request on that worker (CLAUDE.md non-negotiable #6).
+rag-worker = "rag.worker.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -78,14 +78,15 @@ of the local workflow.
 | Postgres | 16.14 native service `postgresql-x64-16`, auto-start, `127.0.0.1:5432` |
 | Credentials | role `rag` / password `rag`; databases `rag` (dev) and `rag_test` (suite) |
 | Superuser | `postgres` / `rag` — local dev only |
+| GPU | NVIDIA (VRAM not yet confirmed — needed to size M4 defaults) |
+| `gh` CLI | installed and authenticated as `Bharat-Sh` |
+| Blob store | filesystem, `./var/blobs` (gitignored) — see docs/adr/0009 |
 
 **`rag` must stay a non-superuser.** It owns its tables, and `FORCE ROW LEVEL
 SECURITY` is the only thing stopping an owner from bypassing every policy.
 Granting it `SUPERUSER` or `BYPASSRLS` to fix a permissions problem would make
 the entire tenant-isolation suite vacuous while still passing — which is exactly
 how CI ran red for two milestones. Never run the suite as `postgres`.
-| GPU | NVIDIA (VRAM not yet confirmed — needed to size M4 defaults) |
-| `gh` CLI | installed, **not authenticated** |
 
 `.env.example` defaults already match the local Postgres, so `cp .env.example .env`
 works with no edits.
@@ -97,6 +98,7 @@ uv run ruff check .          uv run ruff format --check .
 uv run mypy                  uv run lint-imports
 uv run pytest                uv run uvicorn rag.api.asgi:app --reload
 uv run rag-admin --help      # bootstrap: create-tenant, create-user, generate-key
+uv run rag-worker --once     # drain the ingestion queue and exit
 ```
 
 The full suite takes a little over two minutes, most of it Argon2 in the
@@ -108,13 +110,15 @@ fixtures and fail in ways that look like real bugs.
 
 ## Current state
 
-**M0, M1 and M2 complete.** Config, logging, request context, errors,
+**M0, M1, M2 and M3a complete.** Config, logging, request context, errors,
 liveness/readiness, Docker, CI (M0); schema, migrations, RLS, repositories,
 unit of work, job queue (M1); password and API-key auth, Ed25519 JWTs with JWKS,
-rotating refresh tokens, RBAC, per-tenant rate limiting, `rag-admin` (M2).
+rotating refresh tokens, RBAC, per-tenant rate limiting, `rag-admin` (M2);
+upload, blob store, ingestion worker, chunking, document/collection endpoints,
+`rag-worker` (M3a).
 
 Gate is green: ruff, `ruff format`, mypy strict, 3/3 import contracts,
-**423 tests** (unit + integration + security, against a real Postgres).
+**584 tests** (unit + integration + security, against a real Postgres).
 
 **Check CI, not just the local gate.** They diverged silently for two
 milestones: the tenant-isolation tests passed locally and failed on every CI run
@@ -193,14 +197,45 @@ Check `git remote -v` before assuming anything about the remote. The repo is
   transaction and the only way to report the conflict would be to destroy work
   the caller had already done.
 
-## Next: M3 — ingestion
+### M3a subtleties worth not re-discovering
 
-Upload, the job queue in anger, parsing, chunking, and the document state
-machine. `rag.services` gains its second and third services; `rag.adapters`
-gains its first parsers.
+- **Starlette buffers the whole request body before a handler runs.** A size
+  check on `UploadFile` therefore protects nothing — the bytes are already on
+  disk. `BodySizeLimitMiddleware` counts them on the ASGI `receive` channel,
+  which is the only place the limit can be real.
+- **Middleware added with `add_middleware` sits *outside* the exception
+  handlers.** Starlette's stack is `ServerErrorMiddleware → user middleware →
+  ExceptionMiddleware → router`, so raising a domain error there yields a 500,
+  not its mapped status. That middleware builds its own problem response.
+- **`CHUNKING → READY` is a temporary edge in `rag.domain.state`.** M3 stops at
+  chunks. **M5 must remove it**: once indexing exists, a document reaching READY
+  without vectors is invisible to retrieval while claiming to be searchable. A
+  test asserts the edge exists, so deleting it is deliberate.
+- **`get_for_processing` is the only ACL-free document read**, for the worker,
+  which has no caller whose principals it could apply. It is still bound by the
+  tenant scope — it widens ACL visibility within one tenant, never across them.
+- **Jobs are idempotent because they have to be.** At-least-once delivery is
+  real (`reap_stalled`), so `ingest` returns early on an already-READY document
+  and `purge` on an already-DELETED one. Without that, redelivery after a crash
+  dead-letters work that actually succeeded.
+- **`documents.create` and `collections.create` translate `IntegrityError`
+  inside a `begin_nested()` SAVEPOINT**, like `users.create`. Without the
+  savepoint Postgres aborts the caller's whole transaction and the conflict can
+  only be reported by destroying their other work.
+- **Token counts are estimates until M4.** `tiktoken` was rejected: a precise
+  count for a model we do not use is worse than an honest approximation.
 
-Everything M3 adds is already behind authentication: a handler that takes
-`UnitOfWorkDep` is tenant-scoped by construction, and `require(Permission.X)`
-gates the action. Add new permissions to `rag.domain.authz.MINIMUM_ROLE` rather
-than checking roles inline — the table is what makes "which endpoints can a
-viewer reach?" answerable.
+## Next: M3b — the remaining parsers
+
+PDF (`pypdf`), DOCX (`python-docx`), and a hardened HTML path (`selectolax`).
+The sniffer already recognises PDF and DOCX and the upload endpoint refuses them
+with "not yet supported", so M3b is a parser registry entry plus its tests.
+
+The security work is the substance, not the parsing: DOCX is zip + XML, so
+`defusedxml` and a decompression-ratio cap are mandatory rather than optional,
+and both formats need element and page caps under the existing parse timeout.
+That is the first code in this system to process genuinely hostile binary input.
+
+Add new permissions to `rag.domain.authz.MINIMUM_ROLE` rather than checking
+roles inline — the table is what makes "which endpoints can a viewer reach?"
+answerable.

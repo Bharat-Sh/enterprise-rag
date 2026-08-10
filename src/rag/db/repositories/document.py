@@ -18,12 +18,13 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from rag.db.models import ChunkORM, DocumentORM, DocumentPermissionORM
 from rag.db.repositories import affected_rows
 from rag.domain.access import Principal
 from rag.domain.enums import DocumentStatus
-from rag.domain.errors import ConcurrentModificationError, NotFoundError
+from rag.domain.errors import AlreadyExistsError, ConcurrentModificationError, NotFoundError
 from rag.domain.models import Chunk, Document
 from rag.domain.state import assert_can_transition
 
@@ -51,6 +52,17 @@ class SqlAlchemyDocumentRepository:
             )
         )
         orm = result.scalar_one_or_none()
+        return orm.to_domain() if orm else None
+
+    async def get_for_processing(self, document_id: UUID) -> Document | None:
+        """Read a document as the system, bypassing the ACL but not the tenant.
+
+        Named to be conspicuous: it is the only read here without an
+        `AccessFilter`. Row-level security still applies — the tenant scope is
+        bound from the job — so this widens visibility *within* one tenant and
+        never across them. A worker has no caller whose principals it could use.
+        """
+        orm = await self._session.get(DocumentORM, document_id)
         return orm.to_domain() if orm else None
 
     async def get_by_content_hash(self, content_hash: str) -> Document | None:
@@ -99,6 +111,7 @@ class SqlAlchemyDocumentRepository:
         collection_id: UUID,
         title: str,
         source_uri: str,
+        blob_key: str,
         content_hash: str,
         mime_type: str,
         size_bytes: int,
@@ -111,6 +124,7 @@ class SqlAlchemyDocumentRepository:
             collection_id=collection_id,
             title=title,
             source_uri=source_uri,
+            blob_key=blob_key,
             content_hash=content_hash,
             mime_type=mime_type,
             size_bytes=size_bytes,
@@ -119,8 +133,21 @@ class SqlAlchemyDocumentRepository:
             acl_principals=list(acl_principals),
             doc_metadata=metadata or {},
         )
-        self._session.add(orm)
-        await self._session.flush()
+        try:
+            # SAVEPOINT, so losing the race on `uq_documents_tenant_id_
+            # content_hash` does not abort the caller's whole transaction. Two
+            # simultaneous uploads of identical bytes both pass the
+            # `get_by_content_hash` probe and both reach here; the constraint is
+            # the only thing that can adjudicate, and the service turns this
+            # into the same idempotent answer the probe would have given.
+            async with self._session.begin_nested():
+                self._session.add(orm)
+                await self._session.flush()
+        except IntegrityError as exc:
+            raise AlreadyExistsError(
+                "A document with these exact contents already exists in this tenant.",
+                details={"content_hash": content_hash},
+            ) from exc
         await self._session.refresh(orm)
         return orm.to_domain()
 

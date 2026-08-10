@@ -242,7 +242,16 @@ class SqlAlchemyCollectionRepository:
         self, *, tenant_id: UUID, slug: str, name: str, description: str | None = None
     ) -> Collection:
         orm = CollectionORM(tenant_id=tenant_id, slug=slug, name=name, description=description)
-        self._session.add(orm)
-        await self._session.flush()
+        try:
+            # SAVEPOINT, so a duplicate slug does not abort the caller's whole
+            # transaction. Same reasoning as `SqlAlchemyUserRepository.create`.
+            async with self._session.begin_nested():
+                self._session.add(orm)
+                await self._session.flush()
+        except IntegrityError as exc:
+            raise AlreadyExistsError(
+                f"A collection with the slug {slug!r} already exists in this tenant.",
+                details={"slug": slug},
+            ) from exc
         await self._session.refresh(orm)
         return orm.to_domain()
