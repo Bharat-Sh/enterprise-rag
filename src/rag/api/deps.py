@@ -46,6 +46,7 @@ from fastapi import Depends, Request
 # which surfaces as a 422 on a route that looked perfectly correct.
 from rag.adapters.auth.passwords import Argon2PasswordHasher
 from rag.adapters.auth.tokens import JwtTokenService
+from rag.adapters.blobs.filesystem import FilesystemBlobStore
 from rag.adapters.ratelimit.inprocess import InProcessRateLimiter
 from rag.api.security import VerifiedCredentialDep
 from rag.core.config import Settings, get_settings
@@ -59,6 +60,7 @@ from rag.domain.authz import Permission, permits
 from rag.domain.errors import AuthenticationError, PermissionDeniedError, RateLimitExceededError
 from rag.domain.ratelimit import RateLimitDecision, RateLimitPolicy
 from rag.services.auth import AuthService
+from rag.services.ingestion import IngestionService
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -180,9 +182,26 @@ def get_rate_limiter(request: Request) -> InProcessRateLimiter:
     return limiter  # type: ignore[no-any-return]
 
 
+def get_blob_store(request: Request) -> FilesystemBlobStore:
+    store = getattr(request.app.state, "blob_store", None)
+    if store is None:  # pragma: no cover - lifespan guarantees it
+        raise DependencyUnavailableError("blob-store", "Blob storage was not initialised.")
+    return store  # type: ignore[no-any-return]
+
+
 TokenServiceDep = Annotated[JwtTokenService, Depends(get_token_service)]
 PasswordHasherDep = Annotated[Argon2PasswordHasher, Depends(get_password_hasher)]
 RateLimiterDep = Annotated[InProcessRateLimiter, Depends(get_rate_limiter)]
+BlobStoreDep = Annotated[FilesystemBlobStore, Depends(get_blob_store)]
+
+
+def get_ingestion_service(
+    uow: UnitOfWorkDep, blobs: BlobStoreDep, settings: SettingsDep
+) -> IngestionService:
+    return IngestionService(uow, blobs=blobs, settings=settings.ingestion)
+
+
+IngestionServiceDep = Annotated[IngestionService, Depends(get_ingestion_service)]
 
 
 def _auth_service(

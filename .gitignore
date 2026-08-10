@@ -33,3 +33,6 @@ models/
 .DS_Store
 Thumbs.db
 junit.xml
+
+# Default blob-store root for local development (RAG_INGESTION__BLOB_ROOT).
+var/

@@ -25,6 +25,7 @@ and we can reconstruct the entire request from logs and traces.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Request
@@ -54,9 +55,11 @@ from rag.domain.errors import (
     InvalidInputError,
     InvalidStateTransitionError,
     NotFoundError,
+    PayloadTooLargeError,
     PermissionDeniedError,
     QuotaExceededError,
     RateLimitExceededError,
+    UnsupportedMediaTypeError,
 )
 
 if TYPE_CHECKING:
@@ -77,6 +80,8 @@ _STATUS_BY_ERROR: dict[type[RAGError], int] = {
     AlreadyExistsError: 409,
     InvalidStateTransitionError: 409,
     ConcurrentModificationError: 409,
+    PayloadTooLargeError: 413,
+    UnsupportedMediaTypeError: 415,
     QuotaExceededError: 429,
     DomainError: 400,
     DependencyUnavailableError: 503,
@@ -90,6 +95,8 @@ _TITLES: dict[int, str] = {
     403: "Forbidden",
     404: "Not Found",
     409: "Conflict",
+    413: "Content Too Large",
+    415: "Unsupported Media Type",
     422: "Unprocessable Entity",
     429: "Too Many Requests",
     500: "Internal Server Error",
@@ -110,17 +117,26 @@ def status_for(exc: RAGError) -> int:
     return 500
 
 
-def correlation_ids(request: Request) -> tuple[str | None, str | None]:
-    """Resolve (request_id, trace_id) for this request.
+def correlation_ids_from_scope(scope: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Resolve (request_id, trace_id) from a raw ASGI scope.
 
-    Prefers the ASGI scope over the contextvars, because on the unhandled-error
-    path the contextvars have already been reset by the time this runs — see the
-    note in `rag.api.middleware.request_context`.
+    Prefers the scope over the contextvars, because on the unhandled-error path
+    the contextvars have already been reset by the time this runs — see the note
+    in `rag.api.middleware.request_context`.
+
+    Takes a scope rather than a `Request` so raw ASGI middleware, which has no
+    `Request` object, can produce responses that carry the same ids as every
+    other error.
     """
-    state: dict[str, Any] = request.scope.get("state") or {}
+    state: dict[str, Any] = scope.get("state") or {}
     request_id = state.get(REQUEST_ID_SCOPE_KEY) or get_request_id()
     trace_id = state.get(TRACE_ID_SCOPE_KEY) or get_trace_id()
     return request_id, trace_id
+
+
+def correlation_ids(request: Request) -> tuple[str | None, str | None]:
+    """Resolve (request_id, trace_id) for this request."""
+    return correlation_ids_from_scope(request.scope)
 
 
 def headers_for(exc: RAGError, status: int) -> dict[str, str]:

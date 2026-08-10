@@ -104,6 +104,52 @@ class PermissionDeniedError(DomainError):
     default_message: ClassVar[str] = "You do not have permission to perform this action."
 
 
+class PayloadTooLargeError(DomainError):
+    """The request body exceeded the configured limit.
+
+    Raised from the ASGI layer *while the body is still arriving*, not after it
+    has been received. Checking afterwards means the bytes are already on disk,
+    so the limit protects nothing it was meant to protect.
+    """
+
+    code: ClassVar[str] = "payload_too_large"
+    default_message: ClassVar[str] = "The request body is too large."
+
+    def __init__(self, *, limit_bytes: int, details: Mapping[str, Any] | None = None) -> None:
+        merged: dict[str, Any] = {"limit_bytes": limit_bytes}
+        merged.update(details or {})
+        super().__init__(
+            f"The request body exceeds the limit of {limit_bytes} bytes.", details=merged
+        )
+        self.limit_bytes = limit_bytes
+
+
+class UnsupportedMediaTypeError(DomainError):
+    """The content is not a format this system can ingest.
+
+    Carries the type we *detected*, which is deliberately not the type the
+    caller declared — see `rag.domain.sniff`. Telling someone their "PDF" was
+    detected as a zip is the single most useful thing this error can say.
+    """
+
+    code: ClassVar[str] = "unsupported_media_type"
+    default_message: ClassVar[str] = "The file type is not supported."
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        detected: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        merged: dict[str, Any] = {}
+        if detected is not None:
+            merged["detected_content_type"] = detected
+        merged.update(details or {})
+        super().__init__(message, details=merged)
+        self.detected = detected
+
+
 class QuotaExceededError(DomainError):
     """A tenant limit was hit: rate, storage, document count, or token budget."""
 

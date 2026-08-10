@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from rag.domain.access import Principal
 from rag.domain.enums import DocumentStatus, UserStatus
 from rag.domain.errors import (
+    AlreadyExistsError,
     ConcurrentModificationError,
     InvalidStateTransitionError,
     NotFoundError,
@@ -37,6 +38,7 @@ async def _make_document(
         collection_id=collection.id,
         title="Employee Handbook",
         source_uri="s3://bucket/handbook.pdf",
+        blob_key="test-blob-key",
         content_hash=content_hash,
         mime_type="application/pdf",
         size_bytes=1024,
@@ -57,10 +59,31 @@ class TestIdempotency:
         await _make_document(uow, tenant, collection)
         await uow.commit()
 
-        with pytest.raises(IntegrityError):
+        # A domain error, not the driver's `IntegrityError`. M3 moved the
+        # translation into the repository so the ingestion service can turn a
+        # lost race into the same idempotent answer the content-hash probe would
+        # have given, instead of a 500.
+        with pytest.raises(AlreadyExistsError):
             await _make_document(uow, tenant, collection)
 
-        await uow.rollback()
+    async def test_a_conflict_does_not_destroy_the_callers_transaction(
+        self, uow: SqlAlchemyUnitOfWork, tenant: Tenant, collection: Collection
+    ) -> None:
+        """The reason the insert runs inside a SAVEPOINT.
+
+        Postgres aborts the whole transaction on a constraint violation, so
+        without one the only way to report the conflict would be to destroy
+        whatever else the caller had already done.
+        """
+        await _make_document(uow, tenant, collection)
+        await uow.commit()
+
+        with pytest.raises(AlreadyExistsError):
+            await _make_document(uow, tenant, collection)
+
+        # The session is still usable, and the first document is still there.
+        surviving = await uow.documents.get_by_content_hash("a" * 64)
+        assert surviving is not None
 
     async def test_the_same_content_may_exist_in_two_tenants(
         self,
@@ -83,6 +106,7 @@ class TestIdempotency:
             collection_id=other_collection.id,
             title="Same File",
             source_uri="s3://bucket/handbook.pdf",
+            blob_key="test-blob-key",
             content_hash="a" * 64,
             mime_type="application/pdf",
             size_bytes=1024,
@@ -394,6 +418,11 @@ class TestChunks:
         await uow.chunks.add_many(document.id, [NewChunk(ordinal=0, text="a")])
         await uow.commit()
 
+        # Still the raw driver error here, deliberately. Only the *document*
+        # insert translates, because only there is a conflict a legitimate user
+        # action (re-uploading the same file). A duplicate chunk ordinal is a
+        # bug in the chunker, and a bug should not be dressed up as a domain
+        # error a caller might try to handle.
         with pytest.raises(IntegrityError):
             await uow.chunks.add_many(document.id, [NewChunk(ordinal=0, text="duplicate")])
 

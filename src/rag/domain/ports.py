@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import AsyncIterator, Sequence
     from datetime import datetime, timedelta
     from types import TracebackType
     from uuid import UUID
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from rag.domain.access import AccessFilter
     from rag.domain.credentials import AccessToken, TokenClaims
     from rag.domain.enums import DocumentStatus, JobKind, JobStatus, Role, UserStatus
+    from rag.domain.ingestion import ParsedDocument
     from rag.domain.models import (
         ApiKey,
         Chunk,
@@ -49,8 +50,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ApiKeyRepository",
+    "BlobStore",
     "ChunkRepository",
     "CollectionRepository",
+    "DocumentParser",
     "DocumentRepository",
     "GroupRepository",
     "JobRepository",
@@ -58,6 +61,7 @@ __all__ = [
     "RateLimiter",
     "RefreshTokenRepository",
     "TenantRepository",
+    "TokenCounter",
     "TokenIssuer",
     "TokenVerifier",
     "UnitOfWork",
@@ -183,6 +187,21 @@ class DocumentRepository(Protocol):
         """
         ...
 
+    async def get_for_processing(self, document_id: UUID) -> Document | None:
+        """Read a document as the *system*, for a background worker.
+
+        The only method here that returns a document without an `AccessFilter`,
+        and it is named to be conspicuous. A worker acts on behalf of the
+        platform rather than a user: there is no caller whose principals could
+        be applied, and applying the uploader's would be wrong the moment their
+        access changed.
+
+        Tenant isolation is untouched — row-level security still applies, bound
+        from the job's own tenant. This widens *ACL* visibility within one
+        tenant, never tenant visibility.
+        """
+        ...
+
     async def list_for(
         self,
         access: AccessFilter,
@@ -200,6 +219,7 @@ class DocumentRepository(Protocol):
         collection_id: UUID,
         title: str,
         source_uri: str,
+        blob_key: str,
         content_hash: str,
         mime_type: str,
         size_bytes: int,
@@ -451,6 +471,86 @@ class RateLimiter(Protocol):
         closed on a limiter outage costs the entire API.
         """
         ...
+
+
+@runtime_checkable
+class BlobStore(Protocol):
+    """Where a document's raw bytes live (docs/adr/0009).
+
+    A port because the filesystem adapter shipped in M3 is not what runs in
+    production — an S3-compatible store is — and the difference should be one
+    adapter and one wiring line, not a change at every call site.
+
+    Keys are opaque to callers. The adapter decides the layout; a caller that
+    builds a key by hand has taken a dependency on the storage layout and will
+    break when it changes.
+    """
+
+    async def put(self, key: str, stream: AsyncIterator[bytes]) -> int:
+        """Write a stream, returning the number of bytes written.
+
+        Takes an iterator rather than `bytes` so an upload is never held in
+        memory in full. Overwriting an existing key is a no-op in effect —
+        keys are content-addressed, so identical keys hold identical bytes.
+        """
+        ...
+
+    async def open(self, key: str) -> AsyncIterator[bytes]:
+        """Stream a blob back. Raises `NotFoundError` if the key is absent."""
+        ...
+
+    async def read(self, key: str) -> bytes:
+        """Read a whole blob. Only for content already known to be bounded."""
+        ...
+
+    async def delete(self, key: str) -> bool:
+        """Remove a blob. False if it was not there — deletion is idempotent."""
+        ...
+
+    def key_for(self, *, tenant_id: UUID, content_hash: str) -> str:
+        """The key for a document's raw bytes.
+
+        Content-addressed *within* a tenant. Identical bytes uploaded by two
+        customers are stored twice, deliberately: sharing them would make one
+        tenant's deletion affect another, and make storage a cross-tenant
+        existence oracle.
+        """
+        ...
+
+    def derived_key_for(self, *, tenant_id: UUID, content_hash: str, kind: str) -> str:
+        """The key for something computed *from* a document, e.g. extracted text.
+
+        Storing extracted text means a change to chunking is a re-chunk rather
+        than a re-parse of every PDF ever ingested.
+        """
+        ...
+
+
+@runtime_checkable
+class DocumentParser(Protocol):
+    """Turns bytes of one content type into text.
+
+    Synchronous on purpose. Parsing is blocking CPU work, and an `async def`
+    that never awaits is a lie that invites someone to call it on the event
+    loop. The caller is responsible for the thread hop, which makes the cost
+    visible at the call site.
+    """
+
+    def parse(self, data: bytes) -> ParsedDocument: ...
+
+
+@runtime_checkable
+class TokenCounter(Protocol):
+    """Counts tokens the way the embedding model will.
+
+    M3 ships a character-ratio estimator; M4 replaces it with the real BGE-M3
+    tokenizer once the model service exists. A port rather than a direct import
+    because chunk sizing is the one place where being wrong is invisible —
+    chunks silently over the model's window get truncated at embedding time,
+    losing their tail with no error anywhere.
+    """
+
+    def count(self, text: str) -> int: ...
 
 
 @runtime_checkable

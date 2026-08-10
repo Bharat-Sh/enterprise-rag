@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import socket
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -33,11 +34,13 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from rag.adapters.auth.passwords import Argon2PasswordHasher
+from rag.adapters.blobs.filesystem import FilesystemBlobStore
 from rag.api.main import create_app
 from rag.core.config import Environment, LogFormat, Settings
 from rag.db.session import create_session_factory
 from rag.db.uow import SqlAlchemyUnitOfWork
 from rag.domain.enums import Role, UserStatus
+from rag.worker.runner import Worker
 from tests.support import generate_private_pem
 
 if TYPE_CHECKING:
@@ -202,7 +205,7 @@ async def collection(uow: SqlAlchemyUnitOfWork, tenant: Tenant) -> Collection:
 
 
 @pytest.fixture
-def api_settings() -> Settings:
+def api_settings(tmp_path: Path) -> Settings:
     """Application settings pointing at the test database.
 
     Argon2 runs at the configured minimum cost. These tests assert behaviour —
@@ -211,7 +214,8 @@ def api_settings() -> Settings:
     minute per run at production parameters.
 
     The signing key is generated per test, so tokens from one test are worthless
-    in another.
+    in another, and the blob root is a per-test temporary directory so uploads
+    cannot leak between tests or into the developer's working tree.
     """
     return Settings(
         _env_file=None,
@@ -230,7 +234,25 @@ def api_settings() -> Settings:
             "argon2_time_cost": 1,
             "argon2_memory_cost_kib": 8192,
         },
+        ingestion={"blob_root": str(tmp_path / "blobs")},
     )
+
+
+@pytest.fixture
+def blob_store(api_settings: Settings) -> FilesystemBlobStore:
+    """The same store the app and worker use, for asserting on stored bytes."""
+    return FilesystemBlobStore(api_settings.ingestion.blob_root)
+
+
+@pytest.fixture
+def worker(session_factory: async_sessionmaker[AsyncSession], api_settings: Settings) -> Worker:
+    """An ingestion worker sharing the test database and blob root.
+
+    Driven with `run_once()` rather than `run_forever()`: a test that starts the
+    loop and sleeps is slow and flaky, and the loop adds nothing to what is
+    being asserted.
+    """
+    return Worker(session_factory, api_settings)
 
 
 @pytest.fixture
