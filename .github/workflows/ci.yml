@@ -117,34 +117,22 @@ jobs:
           RAG_TEST_DB_USER: rag
           RAG_TEST_DB_PASSWORD: rag
           RAG_TEST_DB_NAME: rag_test
-        run: uv run pytest --cov=rag --cov-report=term-missing --cov-report=xml
-
-      # Guards against the integration and security suites silently skipping in
-      # CI, which would turn a security regression into a passing build.
-      #
-      # `tests/security` gets the same treatment for a stronger reason: CLAUDE.md
-      # says those tests must never be skipped or marked xfail. Auto-skipping on
-      # an unreachable database is honest on a developer laptop and unacceptable
-      # here, where the database is a service container that is supposed to be up.
-      - name: Assert integration and security tests actually ran
-        env:
-          RAG_TEST_DB_HOST: 127.0.0.1
-          RAG_TEST_DB_PORT: "5432"
-          RAG_TEST_DB_USER: rag
-          RAG_TEST_DB_PASSWORD: rag
-          RAG_TEST_DB_NAME: rag_test
         run: |
-          for suite in integration security; do
-            echo "::group::$suite"
-            uv run pytest "tests/$suite" -q --no-header -p no:cacheprovider \
-              | tee "/tmp/$suite.log"
-            grep -qE '[0-9]+ passed' "/tmp/$suite.log"
-            if grep -qE '[0-9]+ skipped' "/tmp/$suite.log"; then
-              echo "::error::$suite tests were skipped — the database was unreachable."
-              exit 1
-            fi
-            echo "::endgroup::"
-          done
+          uv run pytest --cov=rag --cov-report=term-missing --cov-report=xml \
+            --junitxml=junit.xml
+
+      # Guards against the integration and security suites silently skipping,
+      # which would turn a data-leak regression into a green build. `tests/
+      # security` gets the same treatment for a stronger reason: CLAUDE.md says
+      # those must never be skipped or marked xfail.
+      #
+      # Asserts on the JUnit XML from the run above rather than re-running the
+      # suites, so the check covers the same run that produced the coverage and
+      # CI does not pay twice for the slowest suite. `if: always()` because a
+      # skipped suite is worth reporting even when something else failed.
+      - name: Assert integration and security tests actually ran
+        if: always()
+        run: uv run python scripts/assert_suites_ran.py junit.xml
 
       - name: Upload coverage
         if: always()
