@@ -9,12 +9,19 @@ license = { text = "MIT" }
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "pydantic>=2.9",
+    # `[email]` pulls in email-validator, which `EmailStr` needs at runtime.
+    "pydantic[email]>=2.9",
     "pydantic-settings>=2.6",
     "structlog>=24.4",
     "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30",
     "alembic>=1.14",
+    # PyJWT rather than python-jose (unmaintained, looser algorithm handling) or
+    # authlib (a whole OAuth framework where we need sign and verify).
+    "pyjwt[crypto]>=2.10",
+    # argon2-cffi directly rather than passlib, which is unmaintained and whose
+    # bcrypt backend broke outright against bcrypt>=4.1.
+    "argon2-cffi>=23.1",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +34,11 @@ dev = [
     "httpx>=0.28",
     "import-linter>=2.1",
 ]
+
+[project.scripts]
+# Bootstrap and break-glass only. A fresh deployment has no tenant and no user,
+# and every endpoint requires a credential; something has to create the first one.
+rag-admin = "rag.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -68,7 +80,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101", "ANN001", "ANN201", "ANN202"] # assert + fixture ergonomics
+# assert + fixture ergonomics, plus S105/S106: a suite that exercises
+# authentication is *made of* literal credentials, and bandit's heuristic reads
+# variable names. Suppressed for tests only — it stays on for src/, where a
+# hardcoded secret is exactly what we want flagged.
+"tests/**/*.py" = ["S101", "S105", "S106", "ANN001", "ANN201", "ANN202"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["rag"]
@@ -103,6 +119,7 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = "-q --strict-markers --strict-config"
 markers = [
     "integration: requires real backing services (docker compose up)",
+    "security: cross-tenant leakage and ACL bypass — never skip, never xfail",
     "e2e: full end-to-end flow",
 ]
 
@@ -137,13 +154,18 @@ forbidden_modules = [
     "rag.services",
     "fastapi",
     "starlette",
+    # M2: credential *formats* are domain logic and use nothing but hashlib and
+    # secrets. The libraries that sign tokens and stretch passwords are vendor
+    # choices, and belong to adapters.
+    "jwt",
+    "argon2",
 ]
 
 [[tool.importlinter.contracts]]
 name = "Services depend on ports, never on concrete adapters"
 type = "forbidden"
 source_modules = ["rag.services"]
-forbidden_modules = ["rag.adapters", "rag.api", "rag.db"]
+forbidden_modules = ["rag.adapters", "rag.api", "rag.db", "jwt", "argon2"]
 
 [[tool.importlinter.contracts]]
 name = "Core is the base layer and depends on nothing of ours"

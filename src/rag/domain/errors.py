@@ -75,6 +75,24 @@ class InvalidInputError(DomainError):
     default_message: ClassVar[str] = "The request was not valid."
 
 
+class AuthenticationError(DomainError):
+    """The caller did not prove who they are.
+
+    401, not 403: 401 means "I do not know who you are", 403 means "I know and
+    you may not". Conflating them makes correct client behaviour impossible —
+    only one of the two is fixed by presenting a different credential.
+
+    Deliberately carries **no detail**. Unknown tenant, unknown user, wrong
+    password, expired token, revoked API key and malformed credential all
+    produce this exact error with this exact message. Every distinction we
+    could draw for a legitimate caller's convenience is a distinction an
+    attacker uses to enumerate: "wrong password" confirms the account exists.
+    """
+
+    code: ClassVar[str] = "unauthenticated"
+    default_message: ClassVar[str] = "Authentication failed."
+
+
 class PermissionDeniedError(DomainError):
     """The caller is authenticated but lacks the required permission.
 
@@ -91,6 +109,42 @@ class QuotaExceededError(DomainError):
 
     code: ClassVar[str] = "quota_exceeded"
     default_message: ClassVar[str] = "A usage quota has been exceeded."
+
+
+class RateLimitExceededError(QuotaExceededError):
+    """The caller is sending requests faster than their allowance.
+
+    A subclass rather than a reuse of `QuotaExceededError`, for the same reason
+    the two conflict errors are distinct: both are 429, but "slow down and retry
+    in four seconds" and "you have used your document allowance for the month"
+    demand completely different client behaviour. The status is inherited
+    through the MRO walk in `rag.api.errors.status_for`, so no mapping changes.
+    """
+
+    code: ClassVar[str] = "rate_limit_exceeded"
+    default_message: ClassVar[str] = "Too many requests."
+
+    def __init__(
+        self,
+        *,
+        retry_after_seconds: int,
+        limit: int,
+        scope: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        merged: dict[str, Any] = {
+            "retry_after_seconds": retry_after_seconds,
+            "limit": limit,
+            "scope": scope,
+        }
+        merged.update(details or {})
+        super().__init__(
+            f"Rate limit of {limit} requests per minute exceeded; retry in {retry_after_seconds}s.",
+            details=merged,
+        )
+        self.retry_after_seconds = retry_after_seconds
+        self.limit = limit
+        self.scope = scope
 
 
 class ConcurrentModificationError(DomainError):

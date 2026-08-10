@@ -90,16 +90,25 @@ Commands (no `make` on Windows — run these directly):
 uv run ruff check .          uv run ruff format --check .
 uv run mypy                  uv run lint-imports
 uv run pytest                uv run uvicorn rag.api.asgi:app --reload
+uv run rag-admin --help      # bootstrap: create-tenant, create-user, generate-key
 ```
+
+The full suite takes a little over two minutes, most of it Argon2 in the
+integration tests. `uv run pytest tests/unit` is seconds.
+
+**Do not run two pytest invocations at once.** Every integration test truncates
+`rag_test` in its `db_engine` fixture, so concurrent runs delete each other's
+fixtures and fail in ways that look like real bugs.
 
 ## Current state
 
-**M0 and M1 complete.** Config, logging, request context, errors,
+**M0, M1 and M2 complete.** Config, logging, request context, errors,
 liveness/readiness, Docker, CI (M0); schema, migrations, RLS, repositories,
-unit of work, job queue (M1).
+unit of work, job queue (M1); password and API-key auth, Ed25519 JWTs with JWKS,
+rotating refresh tokens, RBAC, per-tenant rate limiting, `rag-admin` (M2).
 
 Gate is green: ruff, `ruff format`, mypy strict, 3/3 import contracts,
-**169 tests** (unit + integration against a real Postgres).
+**421 tests** (unit + integration + security, against a real Postgres).
 
 Commits are authored as `122530216+Bharat-Sh@users.noreply.github.com` — keep it
 that way; the repo is intended to be public eventually and a real address in git
@@ -130,16 +139,53 @@ Check `git remote -v` before assuming anything about the remote. The repo is
   means it arrived second (re-read and retry). Both 409; different client
   behaviour, so they need different codes.
 
-## Next: M2 — authentication and RBAC
+### M2 subtleties worth not re-discovering
 
-Password and API-key auth, JWT with asymmetric keys and OIDC-shaped claims,
-tenant-scoped request dependencies, per-tenant rate limiting.
+- **Every type used in an `Annotated[..., Depends(...)]` alias must be imported
+  at *runtime*, not under `TYPE_CHECKING`.** FastAPI resolves dependency
+  annotations with `get_type_hints` when a route is registered. An unresolvable
+  name is silently reinterpreted as a **required query parameter**, so the route
+  returns a blanket 422 and never reaches its handler. Cost an hour. Guarded by
+  `tests/security/test_route_coverage.py::TestParameterResolution`.
+- **FastAPI no longer flattens included routers onto `app.routes`.** They are
+  wrapped in `_IncludedRouter`, holding `original_router` and the mount prefix
+  in `include_context`. Any code walking routes must recurse — and a route-walk
+  that finds nothing *passes*, which is why that test asserts its own
+  enumeration against the OpenAPI paths first.
+- **`iat` is a NumericDate — whole seconds.** `users.tokens_valid_after` has
+  microsecond precision, so the comparison truncates the watermark to the
+  second. Without that, the replacement token issued *by* a password change is
+  rejected by the watermark that change just set. The cost is a one-second
+  boundary, which is inherent to the resolution and not a choice. Pinned in
+  `tests/unit/test_models.py`.
+- **The credential carries the tenant.** RLS is bound from it before the
+  credential is validated, so a forged tenant finds zero rows rather than
+  failing a comparison. This is what lets `api_keys` and `refresh_tokens` stay
+  under RLS despite being read *by* the authentication path. See ADR-0007.
+- **`get_unscoped_unit_of_work` has exactly three call sites** — login, refresh,
+  logout. Asserted by test. Everything else takes `UnitOfWorkDep`, which cannot
+  be obtained without a verified tenant.
+- **An API key's role ceiling must reach `AccessFilter.build`.** Applying it only
+  to route permissions narrows what the key may *call* and leaves what it may
+  *read* untouched, which is the more damaging half.
+- **`argon2.PasswordHasher` uses `__slots__`**, so instance attributes cannot be
+  monkeypatched; patch the class instead.
+- **`EmailStr` rejects `.test` and `.local`** as special-use domains. Test
+  fixtures use `.example`.
+- **A check-then-insert cannot win a race.** `UserRepository.create` wraps its
+  flush in `begin_nested()` (a SAVEPOINT) and translates `IntegrityError` into
+  `AlreadyExistsError` — without the savepoint, Postgres aborts the whole
+  transaction and the only way to report the conflict would be to destroy work
+  the caller had already done.
 
-The wiring that matters: `get_unit_of_work` in `rag/api/deps.py` must call
-`scope_to_tenant()` with the tenant from the **verified token** before any
-handler runs — never from a request body, query parameter, or header. Until then
-the RLS scope is bound only by tests.
+## Next: M3 — ingestion
 
-Cross-tenant lookups raise `NotFoundError`, never `PermissionDeniedError`:
-returning 403 for a resource in another tenant confirms it exists, which is an
-enumeration oracle.
+Upload, the job queue in anger, parsing, chunking, and the document state
+machine. `rag.services` gains its second and third services; `rag.adapters`
+gains its first parsers.
+
+Everything M3 adds is already behind authentication: a handler that takes
+`UnitOfWorkDep` is tenant-scoped by construction, and `require(Permission.X)`
+gates the action. Add new permissions to `rag.domain.authz.MINIMUM_ROLE` rather
+than checking roles inline — the table is what makes "which endpoints can a
+viewer reach?" answerable.

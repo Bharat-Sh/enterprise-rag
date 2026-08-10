@@ -48,6 +48,7 @@ from rag.core.errors import (
 from rag.core.logging import get_logger
 from rag.domain.errors import (
     AlreadyExistsError,
+    AuthenticationError,
     ConcurrentModificationError,
     DomainError,
     InvalidInputError,
@@ -55,6 +56,7 @@ from rag.domain.errors import (
     NotFoundError,
     PermissionDeniedError,
     QuotaExceededError,
+    RateLimitExceededError,
 )
 
 if TYPE_CHECKING:
@@ -69,6 +71,7 @@ PROBLEM_TYPE_BASE = "https://docs.enterprise-rag.dev/errors/"
 # no explicit entry inherits its parent's status.
 _STATUS_BY_ERROR: dict[type[RAGError], int] = {
     InvalidInputError: 400,
+    AuthenticationError: 401,
     PermissionDeniedError: 403,
     NotFoundError: 404,
     AlreadyExistsError: 409,
@@ -83,6 +86,7 @@ _STATUS_BY_ERROR: dict[type[RAGError], int] = {
 
 _TITLES: dict[int, str] = {
     400: "Bad Request",
+    401: "Unauthorized",
     403: "Forbidden",
     404: "Not Found",
     409: "Conflict",
@@ -119,6 +123,31 @@ def correlation_ids(request: Request) -> tuple[str | None, str | None]:
     return request_id, trace_id
 
 
+def headers_for(exc: RAGError, status: int) -> dict[str, str]:
+    """Response headers a particular failure is required to carry.
+
+    Two of these are protocol obligations rather than niceties. RFC 9110 makes
+    `WWW-Authenticate` mandatory on a 401 — without it a client cannot discover
+    which scheme to use, and generated SDKs will not attempt a token refresh.
+    `Retry-After` on a 429 is what turns "back off" from advice into something a
+    client can implement without guessing.
+    """
+    if status == 401:
+        # No `error=` parameter: RFC 6750 allows one, and every value we could
+        # put there ("invalid_token", "invalid_request") tells a caller *how*
+        # their credential failed. See `AuthenticationError`.
+        return {"WWW-Authenticate": 'Bearer realm="rag-api"'}
+
+    if isinstance(exc, RateLimitExceededError):
+        return {
+            "Retry-After": str(exc.retry_after_seconds),
+            "X-RateLimit-Limit": str(exc.limit),
+            "X-RateLimit-Remaining": "0",
+        }
+
+    return {}
+
+
 def problem_response(
     *,
     status: int,
@@ -128,6 +157,7 @@ def problem_response(
     extra: dict[str, Any] | None = None,
     request_id: str | None = None,
     trace_id: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """Build an RFC 9457 problem response carrying the correlation ids."""
     body: dict[str, Any] = {
@@ -148,17 +178,17 @@ def problem_response(
     # `send` wrapper. ServerErrorMiddleware emits the 500 through the raw server
     # `send`, bypassing that wrapper entirely, so a 500 would otherwise carry
     # neither header.
-    headers: dict[str, str] = {}
+    response_headers: dict[str, str] = dict(headers or {})
     if request_id is not None:
-        headers[REQUEST_ID_HEADER] = request_id
+        response_headers[REQUEST_ID_HEADER] = request_id
     if trace_id is not None:
-        headers[TRACE_ID_HEADER] = trace_id
+        response_headers[TRACE_ID_HEADER] = trace_id
 
     return JSONResponse(
         status_code=status,
         content=body,
         media_type=PROBLEM_CONTENT_TYPE,
-        headers=headers,
+        headers=response_headers,
     )
 
 
@@ -186,6 +216,7 @@ def register_exception_handlers(app: FastAPI, settings: Settings) -> None:
             extra={"errors": exc.details} if exc.details else None,
             request_id=request_id,
             trace_id=trace_id,
+            headers=headers_for(exc, status),
         )
 
     async def handle_validation_error(request: Request, exc: Exception) -> JSONResponse:

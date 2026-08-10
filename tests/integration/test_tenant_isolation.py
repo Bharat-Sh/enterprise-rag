@@ -20,6 +20,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from rag.db.models import TENANT_SCOPED_TABLES
 from rag.db.session import current_tenant_scope
 from rag.domain.enums import Role, UserStatus
 from tests.integration.conftest import requires_postgres
@@ -83,10 +84,7 @@ class TestRowLevelSecurityReads:
 
         assert await current_tenant_scope(uow.session) is None
 
-    @pytest.mark.parametrize(
-        "table",
-        ["users", "groups", "group_members", "collections", "documents", "chunks"],
-    )
+    @pytest.mark.parametrize("table", TENANT_SCOPED_TABLES)
     async def test_every_tenant_scoped_table_is_protected(
         self, uow: SqlAlchemyUnitOfWork, tenant: Tenant, table: str
     ) -> None:
@@ -94,6 +92,12 @@ class TestRowLevelSecurityReads:
 
         A new tenant-scoped table is exactly the kind of thing that gets shipped
         with its RLS forgotten, because everything appears to work.
+
+        Parametrised from `TENANT_SCOPED_TABLES` rather than a list written out
+        here. A hand-maintained copy drifts silently — M2 added `api_keys` and
+        `refresh_tokens` and this test would have kept passing without them.
+        Deriving it also checks the coupling that matters: the migration keeps
+        its *own* copy of the list on purpose, so this asserts the two agree.
         """
         await uow.scope_to_tenant(None)
 
@@ -103,10 +107,7 @@ class TestRowLevelSecurityReads:
 
         assert result.scalar_one() == 0
 
-    @pytest.mark.parametrize(
-        "table",
-        ["users", "groups", "group_members", "collections", "documents", "chunks"],
-    )
+    @pytest.mark.parametrize("table", TENANT_SCOPED_TABLES)
     async def test_policies_are_forced_not_merely_enabled(
         self, uow: SqlAlchemyUnitOfWork, table: str
     ) -> None:
@@ -126,6 +127,19 @@ class TestRowLevelSecurityReads:
         assert enabled is True, f"{table} does not have RLS enabled"
         assert forced is True, f"{table} has RLS enabled but not FORCED — it is inert"
 
+    async def test_jobs_is_deliberately_exempt(self, uow: SqlAlchemyUnitOfWork) -> None:
+        """The one exemption, pinned so it stays a decision rather than a gap.
+
+        Workers poll across tenants by design and then scope themselves to each
+        claimed job. No HTTP endpoint exposes the table, so the exemption does
+        not widen the API surface — see docs/adr/0005.
+        """
+        result = await uow.session.execute(
+            text("SELECT relrowsecurity FROM pg_class WHERE relname = 'jobs'")
+        )
+
+        assert result.scalar_one() is False
+
 
 class TestRowLevelSecurityWrites:
     async def test_cannot_insert_a_row_for_another_tenant(
@@ -144,7 +158,7 @@ class TestRowLevelSecurityWrites:
         with pytest.raises(DBAPIError, match="row-level security"):
             await uow.users.create(
                 tenant_id=other_tenant.id,
-                email="mallory@globex.test",
+                email="mallory@globex.example",
                 full_name="Mallory",
                 role=Role.ADMIN,
                 status=UserStatus.ACTIVE,
@@ -173,7 +187,9 @@ class TestRowLevelSecurityWrites:
         await uow.scope_to_tenant(None)
 
         with pytest.raises(DBAPIError, match="row-level security"):
-            await uow.users.create(tenant_id=tenant.id, email="ghost@acme.test", full_name="Ghost")
+            await uow.users.create(
+                tenant_id=tenant.id, email="ghost@acme.example", full_name="Ghost"
+            )
 
         await uow.rollback()
 
@@ -186,12 +202,12 @@ class TestScopeLifetime:
         unit of work would silently see zero rows — a bug that looks like data
         loss and is maddening to trace.
         """
-        await uow.users.create(tenant_id=tenant.id, email="first@acme.test")
+        await uow.users.create(tenant_id=tenant.id, email="first@acme.example")
         await uow.commit()
 
         assert await current_tenant_scope(uow.session) == tenant.id
 
-        await uow.users.create(tenant_id=tenant.id, email="second@acme.test")
+        await uow.users.create(tenant_id=tenant.id, email="second@acme.example")
         await uow.commit()
 
         result = await uow.session.execute(text("SELECT count(*) FROM users"))

@@ -8,10 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from rag.core.config import Environment, LogFormat, Settings, get_settings
-
-# A password that satisfies the production check, so tests can exercise *other*
-# production rules without tripping the default-credential guard first.
-SAFE_PASSWORD = "not-the-development-default"  # noqa: S105 - test fixture, not a real secret
+from tests.support import SAFE_PASSWORD, generate_private_pem, production_overrides
 
 
 def _make(**overrides: Any) -> Settings:
@@ -112,10 +109,7 @@ class TestDerivedValues:
         assert settings.expose_error_details is True
 
     def test_docs_and_error_details_are_off_in_production(self) -> None:
-        settings = _make(
-            environment=Environment.PROD,
-            database={"password": SAFE_PASSWORD},
-        )
+        settings = _make(environment=Environment.PROD, **production_overrides())
 
         assert settings.effective_docs_enabled is False
         assert settings.expose_error_details is False
@@ -141,23 +135,42 @@ class TestFailFast:
         with pytest.raises(ValidationError, match="reload"):
             _make(
                 environment=Environment.PROD,
-                database={"password": SAFE_PASSWORD},
                 server={"reload": True},
+                **production_overrides(),
             )
 
     def test_explicitly_enabling_docs_is_rejected_in_production(self) -> None:
         with pytest.raises(ValidationError, match="docs_enabled"):
             _make(
                 environment=Environment.PROD,
-                database={"password": SAFE_PASSWORD},
                 docs_enabled=True,
+                **production_overrides(),
+            )
+
+    def test_missing_signing_key_is_rejected_in_production(self) -> None:
+        # Locally a missing key means "generate an ephemeral one". Doing that in
+        # production would sign tokens with a key no other replica holds, and
+        # log every user out on every deploy.
+        with pytest.raises(ValidationError, match="private_key"):
+            _make(
+                environment=Environment.PROD,
+                database={"password": SAFE_PASSWORD},
+                auth={"issuer": "https://rag.example.test"},
+            )
+
+    def test_plaintext_issuer_is_rejected_in_production(self) -> None:
+        with pytest.raises(ValidationError, match="issuer must be https"):
+            _make(
+                environment=Environment.PROD,
+                database={"password": SAFE_PASSWORD},
+                auth={
+                    "private_key_pem": generate_private_pem(),
+                    "issuer": "http://rag.example.test",
+                },
             )
 
     def test_a_valid_production_config_is_accepted(self) -> None:
-        settings = _make(
-            environment=Environment.PROD,
-            database={"password": SAFE_PASSWORD},
-        )
+        settings = _make(environment=Environment.PROD, **production_overrides())
 
         assert settings.environment.is_production_like is True
 

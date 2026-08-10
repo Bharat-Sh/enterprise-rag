@@ -47,6 +47,7 @@ from rag.domain.enums import (
 
 __all__ = [
     "TENANT_SCOPED_TABLES",
+    "ApiKeyORM",
     "ChunkORM",
     "CollectionORM",
     "DocumentORM",
@@ -54,6 +55,7 @@ __all__ = [
     "GroupMemberORM",
     "GroupORM",
     "JobORM",
+    "RefreshTokenORM",
     "TenantORM",
     "UserORM",
 ]
@@ -114,6 +116,12 @@ class UserORM(UUIDPrimaryKeyMixin, TenantScopedMixin, TimestampMixin, Base):
     )
     last_login_at: Mapped[datetime | None] = mapped_column()
 
+    #: Access tokens issued before this instant are rejected. Set on password
+    #: change, forced logout, and admin lockout. This is how a stateless token
+    #: becomes revocable without a denylist: the user row is loaded on every
+    #: request anyway, so the check is free (docs/adr/0007).
+    tokens_valid_after: Mapped[datetime | None] = mapped_column()
+
     def to_domain(self) -> domain.User:
         return domain.User(
             id=self.id,
@@ -125,6 +133,108 @@ class UserORM(UUIDPrimaryKeyMixin, TenantScopedMixin, TimestampMixin, Base):
             created_at=self.created_at,
             updated_at=self.updated_at,
             last_login_at=self.last_login_at,
+            tokens_valid_after=self.tokens_valid_after,
+        )
+
+
+class ApiKeyORM(UUIDPrimaryKeyMixin, TenantScopedMixin, TimestampMixin, Base):
+    """Machine credentials (docs/adr/0007).
+
+    Under row-level security like every other table holding customer data. That
+    is possible — despite this being the table the *authentication* lookup reads
+    — because the key's own tenant segment binds the scope before the lookup
+    runs. Exempting it the way `jobs` is exempt was rejected: unlike `jobs`,
+    this table has management endpoints, so it is exactly the code most in need
+    of the backstop.
+    """
+
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        # The authentication lookup, in one index hit. Scoped by tenant because
+        # RLS has already narrowed the visible rows and a composite index lets
+        # the planner use both predicates.
+        UniqueConstraint("tenant_id", "secret_hash", name="uq_api_keys_tenant_id_secret_hash"),
+        Index("ix_api_keys_user_id", "user_id"),
+    )
+
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    #: Human label, chosen by whoever created the key ("ci-deploy", "laptop").
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: First few characters of the secret, kept in clear so a key is
+    #: recognisable in a list. The rest is unrecoverable.
+    display_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: Hex SHA-256 of the secret. Not Argon2 — see rag.domain.credentials.
+    secret_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: A ceiling on the owner's role, never a grant of its own.
+    role: Mapped[Role] = mapped_column(
+        _pg_enum(Role, "user_role"), nullable=False, default=Role.VIEWER
+    )
+    created_by: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    expires_at: Mapped[datetime | None] = mapped_column()
+    last_used_at: Mapped[datetime | None] = mapped_column()
+    revoked_at: Mapped[datetime | None] = mapped_column()
+
+    def to_domain(self) -> domain.ApiKey:
+        return domain.ApiKey(
+            id=self.id,
+            tenant_id=self.tenant_id,
+            user_id=self.user_id,
+            name=self.name,
+            display_prefix=self.display_prefix,
+            role=self.role,
+            created_at=self.created_at,
+            created_by=self.created_by,
+            expires_at=self.expires_at,
+            last_used_at=self.last_used_at,
+            revoked_at=self.revoked_at,
+        )
+
+
+class RefreshTokenORM(UUIDPrimaryKeyMixin, TenantScopedMixin, Base):
+    """Rotating refresh tokens with family-level reuse detection."""
+
+    __tablename__ = "refresh_tokens"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "token_hash", name="uq_refresh_tokens_tenant_id_token_hash"),
+        Index("ix_refresh_tokens_family_id", "family_id"),
+        Index("ix_refresh_tokens_user_id", "user_id"),
+        # Supports the housekeeping sweep that deletes expired rows. Without it
+        # this table grows without bound: one row per login, forever.
+        Index("ix_refresh_tokens_expires_at", "expires_at"),
+    )
+
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: Shared by every token in one rotation lineage. Replaying a spent token
+    #: revokes the family, because two parties holding one single-use token
+    #: means one of them stole it.
+    family_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+
+    issued_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column()
+    revoked_at: Mapped[datetime | None] = mapped_column()
+    replaced_by: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("refresh_tokens.id", ondelete="SET NULL")
+    )
+
+    def to_domain(self) -> domain.RefreshToken:
+        return domain.RefreshToken(
+            id=self.id,
+            tenant_id=self.tenant_id,
+            user_id=self.user_id,
+            family_id=self.family_id,
+            issued_at=self.issued_at,
+            expires_at=self.expires_at,
+            used_at=self.used_at,
+            revoked_at=self.revoked_at,
+            replaced_by=self.replaced_by,
         )
 
 
@@ -409,6 +519,8 @@ class JobORM(UUIDPrimaryKeyMixin, TenantScopedMixin, TimestampMixin, Base):
 #: list, so adding a tenant-scoped table here is what turns its policy on.
 TENANT_SCOPED_TABLES: tuple[str, ...] = (
     "users",
+    "api_keys",
+    "refresh_tokens",
     "groups",
     "group_members",
     "collections",

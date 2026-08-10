@@ -26,30 +26,40 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from types import TracebackType
     from uuid import UUID
 
     from rag.domain.access import AccessFilter
+    from rag.domain.credentials import AccessToken, TokenClaims
     from rag.domain.enums import DocumentStatus, JobKind, JobStatus, Role, UserStatus
     from rag.domain.models import (
+        ApiKey,
         Chunk,
         Collection,
         Document,
         Group,
         Job,
         NewChunk,
+        RefreshToken,
         Tenant,
         User,
     )
+    from rag.domain.ratelimit import RateLimitDecision, RateLimitPolicy
 
 __all__ = [
+    "ApiKeyRepository",
     "ChunkRepository",
     "CollectionRepository",
     "DocumentRepository",
     "GroupRepository",
     "JobRepository",
+    "PasswordHasher",
+    "RateLimiter",
+    "RefreshTokenRepository",
     "TenantRepository",
+    "TokenIssuer",
+    "TokenVerifier",
     "UnitOfWork",
     "UserRepository",
 ]
@@ -91,13 +101,47 @@ class UserRepository(Protocol):
         """Groups the user belongs to, for assembling their `AccessFilter`."""
         ...
 
-    async def access_filter_for(self, user: User) -> AccessFilter:
+    async def access_filter_for(self, user: User, *, role: Role | None = None) -> AccessFilter:
         """Build the caller's complete principal set.
 
         Computed per request rather than stored, which is what lets a group
         membership change take effect without re-indexing a single document.
+
+        `role` overrides `user.role` so an API key's ceiling reaches the filter.
+        Without it a key scoped down to viewer would still carry the
+        `role:admin` principal and match admin-granted document ACLs.
         """
         ...
+
+    async def get_password_hash(self, user_id: UUID) -> str | None:
+        """Read the stored password hash.
+
+        Separate from `get()` so the hash never rides along on the `User` the
+        rest of the system passes around, gets logged, or is serialised into a
+        response by an over-eager `model_validate`.
+        """
+        ...
+
+    async def set_password_hash(self, user_id: UUID, password_hash: str) -> None: ...
+
+    async def touch_last_login(self, user_id: UUID, *, at: datetime) -> None: ...
+
+    async def invalidate_tokens_before(self, user_id: UUID, *, at: datetime) -> None:
+        """Reject every access token issued before `at`.
+
+        The revocation mechanism for stateless tokens. A denylist was rejected:
+        it needs infrastructure we do not have until M9, it is eventually
+        consistent, and it is a network hop to answer a question that a column
+        on a row we already load answers exactly. The watermark is read back on
+        `User` itself, so checking it costs no extra query.
+        """
+        ...
+
+    async def list_all(self, *, limit: int = 50, offset: int = 0) -> Sequence[User]: ...
+
+    async def set_role(self, user_id: UUID, role: Role) -> User: ...
+
+    async def set_status(self, user_id: UUID, status: UserStatus) -> User: ...
 
 
 @runtime_checkable
@@ -258,6 +302,158 @@ class JobRepository(Protocol):
 
 
 @runtime_checkable
+class ApiKeyRepository(Protocol):
+    """API keys within the currently scoped tenant (docs/adr/0007).
+
+    Every method here runs under row-level security, including the
+    authentication lookup — the tenant is bound from the key's own tenant
+    segment before `get_by_hash` runs. A key quoting another tenant therefore
+    finds nothing rather than finding a row it must then be compared against.
+    """
+
+    async def get_by_hash(self, secret_hash: str) -> ApiKey | None: ...
+
+    async def get(self, key_id: UUID) -> ApiKey | None: ...
+
+    async def create(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        name: str,
+        display_prefix: str,
+        secret_hash: str,
+        role: Role,
+        created_by: UUID | None = None,
+        expires_at: datetime | None = None,
+    ) -> ApiKey: ...
+
+    async def list_for_user(self, user_id: UUID) -> Sequence[ApiKey]: ...
+
+    async def revoke(self, key_id: UUID, *, at: datetime) -> bool:
+        """Mark a key unusable. Returns False if it was already revoked or absent."""
+        ...
+
+    async def touch_last_used(self, key_id: UUID, *, at: datetime, stale_after: timedelta) -> bool:
+        """Record use, but only if the stored timestamp is already stale.
+
+        Writing on every request would turn every authenticated GET into an
+        update of the busiest row in the tenant: WAL amplification and row
+        contention, bought with timestamp precision nobody reads.
+
+        Returns whether a row was actually written, so the caller can skip a
+        commit round trip on the overwhelmingly common no-op path.
+        """
+        ...
+
+
+@runtime_checkable
+class RefreshTokenRepository(Protocol):
+    """Rotating refresh tokens, scoped to the current tenant."""
+
+    async def create(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        token_hash: str,
+        family_id: UUID,
+        expires_at: datetime,
+    ) -> RefreshToken: ...
+
+    async def get_by_hash(self, token_hash: str) -> RefreshToken | None: ...
+
+    async def mark_used(self, token_id: UUID, *, at: datetime, replaced_by: UUID) -> bool:
+        """Consume a token. Returns False if it was already spent.
+
+        A compare-and-set rather than a read-then-write, so two requests racing
+        with the same refresh token cannot both succeed — which is what makes
+        reuse detection reliable rather than probabilistic.
+        """
+        ...
+
+    async def revoke_family(self, family_id: UUID, *, at: datetime) -> int:
+        """Kill an entire rotation lineage. The response to a replayed token."""
+        ...
+
+    async def revoke_for_user(self, user_id: UUID, *, at: datetime) -> int: ...
+
+
+@runtime_checkable
+class PasswordHasher(Protocol):
+    """Password stretching. Async because the work belongs in a thread.
+
+    Argon2 is 50-100 ms of CPU. Running it on the event loop stalls every
+    concurrent request on the worker, including open SSE streams — the sixth
+    non-negotiable in CLAUDE.md, and one that no linter will catch here because
+    the call is not a *known* blocking primitive.
+    """
+
+    async def hash(self, password: str) -> str: ...
+
+    async def verify(self, password_hash: str | None, password: str) -> bool:
+        """Check a password, tolerating a missing hash.
+
+        `None` must still do the work: `users.password_hash` is nullable for
+        SSO-provisioned accounts, and short-circuiting on it would make "this
+        account has no password" measurably faster than "wrong password".
+        """
+        ...
+
+    def needs_rehash(self, password_hash: str) -> bool:
+        """Whether the stored hash predates the current cost parameters.
+
+        Synchronous: it parses the hash string and does no work. Raising cost
+        parameters is worthless without this — existing users would keep their
+        old, cheaper hashes forever.
+        """
+        ...
+
+
+@runtime_checkable
+class TokenIssuer(Protocol):
+    """Mints signed access tokens. Held only where tokens are created."""
+
+    def issue_access_token(self, *, subject: UUID, tenant_id: UUID) -> AccessToken: ...
+
+
+@runtime_checkable
+class TokenVerifier(Protocol):
+    """Verifies signed access tokens.
+
+    Split from `TokenIssuer` even though one adapter satisfies both: a verifier
+    needs only public keys, and a deployment that verifies without being able to
+    sign is a real and desirable shape.
+    """
+
+    def verify_access_token(self, token: str) -> TokenClaims:
+        """Verify signature, algorithm, `kid`, `typ`, `exp`, `nbf`, `aud`, `iss`.
+
+        Raises `AuthenticationError` for every failure, without distinguishing
+        them to the caller.
+        """
+        ...
+
+    def public_jwks(self) -> dict[str, Any]:
+        """The public key set, for `/.well-known/jwks.json`."""
+        ...
+
+
+@runtime_checkable
+class RateLimiter(Protocol):
+    """Token-bucket accounting (docs/adr/0008)."""
+
+    async def check(self, key: str, policy: RateLimitPolicy, *, cost: int = 1) -> RateLimitDecision:
+        """Consume `cost` tokens if available, and report the outcome.
+
+        Implementations **fail open**: a limiter that cannot answer must admit
+        the request and log loudly. Losing rate limiting costs fairness; failing
+        closed on a limiter outage costs the entire API.
+        """
+        ...
+
+
+@runtime_checkable
 class UnitOfWork(Protocol):
     """A transaction boundary exposing the repositories that share it.
 
@@ -273,6 +469,8 @@ class UnitOfWork(Protocol):
     documents: DocumentRepository
     chunks: ChunkRepository
     jobs: JobRepository
+    api_keys: ApiKeyRepository
+    refresh_tokens: RefreshTokenRepository
 
     async def __aenter__(self) -> UnitOfWork: ...
 

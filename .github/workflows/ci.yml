@@ -95,9 +95,14 @@ jobs:
           RAG_TEST_DB_NAME: rag_test
         run: uv run pytest --cov=rag --cov-report=term-missing --cov-report=xml
 
-      # Guards against the integration suite silently skipping in CI, which
-      # would turn a security regression into a passing build.
-      - name: Assert integration tests actually ran
+      # Guards against the integration and security suites silently skipping in
+      # CI, which would turn a security regression into a passing build.
+      #
+      # `tests/security` gets the same treatment for a stronger reason: CLAUDE.md
+      # says those tests must never be skipped or marked xfail. Auto-skipping on
+      # an unreachable database is honest on a developer laptop and unacceptable
+      # here, where the database is a service container that is supposed to be up.
+      - name: Assert integration and security tests actually ran
         env:
           RAG_TEST_DB_HOST: 127.0.0.1
           RAG_TEST_DB_PORT: "5432"
@@ -105,15 +110,17 @@ jobs:
           RAG_TEST_DB_PASSWORD: rag
           RAG_TEST_DB_NAME: rag_test
         run: |
-          count=$(uv run pytest tests/integration -q --collect-only 2>/dev/null | tail -1)
-          echo "collected: $count"
-          uv run pytest tests/integration -q --no-header -p no:cacheprovider \
-            | tee /tmp/integration.log
-          grep -qE '[0-9]+ passed' /tmp/integration.log
-          if grep -qE '[0-9]+ skipped' /tmp/integration.log; then
-            echo "::error::Integration tests were skipped — the database was unreachable."
-            exit 1
-          fi
+          for suite in integration security; do
+            echo "::group::$suite"
+            uv run pytest "tests/$suite" -q --no-header -p no:cacheprovider \
+              | tee "/tmp/$suite.log"
+            grep -qE '[0-9]+ passed' "/tmp/$suite.log"
+            if grep -qE '[0-9]+ skipped' "/tmp/$suite.log"; then
+              echo "::error::$suite tests were skipped — the database was unreachable."
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
 
       - name: Upload coverage
         if: always()

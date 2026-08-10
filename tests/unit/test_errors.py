@@ -163,12 +163,13 @@ class TestProductionDisclosure:
     async def test_internal_details_are_hidden_in_production(self) -> None:
         from rag.api.main import create_app
         from rag.core.config import Environment, Settings
+        from tests.support import production_overrides
 
         settings = Settings(
             _env_file=None,
             environment=Environment.PROD,
             log_level="CRITICAL",
-            database={"password": "not-the-development-default"},
+            **production_overrides(),
         )
         prod_app = create_app(settings)
 

@@ -24,7 +24,7 @@ class TestPrincipalTokens:
 
     def test_token_format_is_type_colon_id(self) -> None:
         assert Principal.user(ALICE).token == f"user:{ALICE}"
-        assert Principal.role(Role.ADMIN).token == "role:admin"  # noqa: S105 - an ACL token
+        assert Principal.role(Role.ADMIN).token == "role:admin"
         assert Principal.tenant(TENANT).token == f"tenant:{TENANT}"
 
     def test_ids_containing_the_separator_are_rejected(self) -> None:

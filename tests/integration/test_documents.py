@@ -225,7 +225,7 @@ class TestAccessControl:
         # Same tenant, so RLS permits the row. Only the ACL stops it — this is
         # the second, independent layer.
         other = await uow.users.create(
-            tenant_id=tenant.id, email="bob@acme.test", status=UserStatus.ACTIVE
+            tenant_id=tenant.id, email="bob@acme.example", status=UserStatus.ACTIVE
         )
         document = await _make_document(
             uow, tenant, collection, acl=(Principal.user(other.id).token,)
