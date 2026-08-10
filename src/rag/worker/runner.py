@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 import anyio
 
 from rag.adapters.blobs.filesystem import FilesystemBlobStore
-from rag.adapters.parsers import parser_for
+from rag.adapters.parsers import build_registry
 from rag.adapters.tokenize import HeuristicTokenCounter
 from rag.core.logging import get_logger
 from rag.db.repositories.job import backoff_delay
@@ -63,6 +63,7 @@ class Worker:
         self._settings = settings
         self._name = settings.worker.name or f"{socket.gethostname()}-{id(self):x}"
         self._blobs = FilesystemBlobStore(settings.ingestion.blob_root)
+        self._parsers = build_registry(settings.ingestion)
         self._tokens = HeuristicTokenCounter()
         self._stopping = anyio.Event()
         self._last_reap = datetime.now(UTC) - timedelta(days=1)
@@ -129,7 +130,7 @@ class Worker:
                 uow,
                 blobs=self._blobs,
                 tokens=self._tokens,
-                parser_for=parser_for,
+                parser_for=self._parsers.get,
                 settings=self._settings.ingestion,
             )
 

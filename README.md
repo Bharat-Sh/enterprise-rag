@@ -4,10 +4,10 @@ A multi-tenant, production-shaped retrieval-augmented generation platform:
 documents in, grounded and cited answers out, with access control, evaluation,
 and observability treated as features rather than afterthoughts.
 
-> **Status: M3a — Ingestion foundation.** Documents can be uploaded, stored,
-> parsed, and chunked by a background worker, behind an API where every endpoint
-> authenticates and every query is tenant-scoped. PDF and DOCX parsing arrives in
-> M3b; retrieval in M5. Milestones below.
+> **Status: M3 — Ingestion complete.** PDF, DOCX, HTML, Markdown and plain text
+> can be uploaded, stored, parsed, and chunked by a background worker, behind an
+> API where every endpoint authenticates and every query is tenant-scoped.
+> Retrieval arrives in M5. Milestones below.
 
 ---
 
@@ -138,6 +138,7 @@ the loser raises rather than overwriting the winner's progress.
 |---|---|
 | **Nothing parses in the API** | Parsing is blocking CPU work; doing it in a handler would stall every concurrent request on that process. A separate `rag-worker` process holds one job at a time, so a document that kills a parser costs one job rather than a batch. |
 | **The bytes decide the type** | `Content-Type` and the filename are caller-supplied. A zip renamed `.pdf` is detected as a zip — a parser chosen from a lie is a parser handed input it never expected. |
+| **Hostile input is bounded, not hoped about** | A DOCX is a zip of XML, so it arrives carrying a decompression bomb and entity expansion by default. Page caps, expansion budgets, compression-ratio limits, and `defusedxml` close each one explicitly. XXE is the serious one: a parser that resolves it makes `/etc/passwd` *searchable*. See [ADR-0010](docs/adr/0010-parsing-hostile-documents.md). |
 | **Size is enforced mid-stream** | Starlette spools the whole body to disk before a handler runs, so a check in the endpoint protects nothing. An ASGI middleware counts bytes as they arrive. |
 | **Blob first, then the transaction** | An orphan blob is inert and collectable; a job whose bytes do not exist is a user-visible failure. This inverts ADR-0001's ordering because a blob is *source* data, not derived. See [ADR-0009](docs/adr/0009-blob-storage.md). |
 | **Extracted text is kept** | So a change to chunking is a re-chunk, not a re-parse of every document ever ingested. |
@@ -340,7 +341,7 @@ caching but not correctness).
 | M1 | Data model — tenants, documents, chunks, jobs; RLS; migrations | **done** |
 | M2 | Auth & RBAC — JWT, API keys, roles, tenant scoping, rate limiting | **done** |
 | M3a | Ingestion — upload, blob store, worker, chunking, state machine | **done** |
-| M3b | Parsers — PDF, DOCX, HTML hardening | next |
+| M3b | Parsers — PDF, DOCX, and hostile-input hardening | **done** |
 | M4 | Model service — BGE-M3 + reranker on GPU, batching | |
 | M5 | Dense retrieval — Qdrant, ACL pre-filter, `/search` | |
 | M6 | Hybrid retrieval — sparse vectors, reciprocal rank fusion | |

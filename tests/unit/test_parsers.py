@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from rag.adapters.parsers import HtmlParser, MarkdownParser, PlainTextParser, parser_for
+from rag.adapters.parsers import HtmlParser, MarkdownParser, PlainTextParser
 from rag.adapters.tokenize import HeuristicTokenCounter
 from rag.db.repositories.job import backoff_delay
-from rag.domain.ingestion import ContentType
 
 
 class TestPlainText:
@@ -105,18 +104,6 @@ class TestHtml:
         parsed = HtmlParser().parse(b"</script><p>still visible</p>")
 
         assert "still visible" in parsed.text
-
-
-class TestRegistry:
-    @pytest.mark.parametrize(
-        "content_type", [ContentType.TEXT, ContentType.MARKDOWN, ContentType.HTML]
-    )
-    def test_text_formats_have_parsers(self, content_type: ContentType) -> None:
-        assert parser_for(content_type) is not None
-
-    @pytest.mark.parametrize("content_type", [ContentType.PDF, ContentType.DOCX])
-    def test_binary_formats_have_none_until_m3b(self, content_type: ContentType) -> None:
-        assert parser_for(content_type) is None
 
 
 class TestTokenEstimator:

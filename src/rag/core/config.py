@@ -247,6 +247,30 @@ class IngestionSettings(BaseModel):
     #: parser into a loop must lose its job, not its worker.
     parse_timeout_seconds: float = Field(default=120.0, gt=0)
 
+    # --- limits on hostile input (docs/adr/0010) --------------------------
+    #
+    # Parsing attacker-supplied binary formats is the largest attack surface in
+    # the system. These caps are what make "the parse timed out" rare rather
+    # than the only defence — a timeout still leaves a thread burning CPU,
+    # because Python cannot cancel one.
+
+    #: Pages read from a PDF. A thousand-page scan is a legitimate document and
+    #: also an excellent way to occupy a worker for an hour.
+    max_pdf_pages: int = Field(default=2000, ge=1)
+
+    #: Total bytes a container may expand to. A DOCX is a zip, and a few
+    #: kilobytes of zeroes compress to gigabytes — the classic decompression
+    #: bomb, which a size limit on the *upload* does nothing about.
+    max_extracted_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
+
+    #: Largest tolerated uncompressed:compressed ratio for a single entry.
+    #: Ordinary office documents sit under 20:1; a bomb is thousands to one.
+    max_compression_ratio: int = Field(default=200, ge=2)
+
+    #: Entries in a container. An archive with a million tiny files exhausts
+    #: time and memory without ever tripping a size limit.
+    max_archive_entries: int = Field(default=2000, ge=1)
+
     @model_validator(mode="after")
     def _overlap_must_be_smaller_than_the_chunk(self) -> IngestionSettings:
         # Overlap >= target does not shrink the remaining text, so the splitter

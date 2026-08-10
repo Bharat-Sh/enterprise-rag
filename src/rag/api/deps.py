@@ -47,6 +47,7 @@ from fastapi import Depends, Request
 from rag.adapters.auth.passwords import Argon2PasswordHasher
 from rag.adapters.auth.tokens import JwtTokenService
 from rag.adapters.blobs.filesystem import FilesystemBlobStore
+from rag.adapters.parsers import ParserRegistry
 from rag.adapters.ratelimit.inprocess import InProcessRateLimiter
 from rag.api.security import VerifiedCredentialDep
 from rag.core.config import Settings, get_settings
@@ -195,10 +196,28 @@ RateLimiterDep = Annotated[InProcessRateLimiter, Depends(get_rate_limiter)]
 BlobStoreDep = Annotated[FilesystemBlobStore, Depends(get_blob_store)]
 
 
+def get_parser_registry(request: Request) -> ParserRegistry:
+    registry = getattr(request.app.state, "parsers", None)
+    if registry is None:  # pragma: no cover - lifespan guarantees it
+        raise DependencyUnavailableError("parsers", "Document parsers were not initialised.")
+    return registry  # type: ignore[no-any-return]
+
+
+ParserRegistryDep = Annotated[ParserRegistry, Depends(get_parser_registry)]
+
+
 def get_ingestion_service(
-    uow: UnitOfWorkDep, blobs: BlobStoreDep, settings: SettingsDep
+    uow: UnitOfWorkDep,
+    blobs: BlobStoreDep,
+    settings: SettingsDep,
+    parsers: ParserRegistryDep,
 ) -> IngestionService:
-    return IngestionService(uow, blobs=blobs, settings=settings.ingestion)
+    return IngestionService(
+        uow,
+        blobs=blobs,
+        settings=settings.ingestion,
+        supported_types=parsers.supported,
+    )
 
 
 IngestionServiceDep = Annotated[IngestionService, Depends(get_ingestion_service)]

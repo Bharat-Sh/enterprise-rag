@@ -110,15 +110,15 @@ fixtures and fail in ways that look like real bugs.
 
 ## Current state
 
-**M0, M1, M2 and M3a complete.** Config, logging, request context, errors,
+**M0 through M3 complete.** Config, logging, request context, errors,
 liveness/readiness, Docker, CI (M0); schema, migrations, RLS, repositories,
 unit of work, job queue (M1); password and API-key auth, Ed25519 JWTs with JWKS,
 rotating refresh tokens, RBAC, per-tenant rate limiting, `rag-admin` (M2);
 upload, blob store, ingestion worker, chunking, document/collection endpoints,
-`rag-worker` (M3a).
+`rag-worker` (M3a); PDF and DOCX parsers with hostile-input hardening (M3b).
 
 Gate is green: ruff, `ruff format`, mypy strict, 3/3 import contracts,
-**584 tests** (unit + integration + security, against a real Postgres).
+**603 tests** (unit + integration + security, against a real Postgres).
 
 **Check CI, not just the local gate.** They diverged silently for two
 milestones: the tenant-isolation tests passed locally and failed on every CI run
@@ -225,16 +225,32 @@ Check `git remote -v` before assuming anything about the remote. The repo is
 - **Token counts are estimates until M4.** `tiktoken` was rejected: a precise
   count for a model we do not use is worse than an honest approximation.
 
-## Next: M3b — the remaining parsers
+### M3b subtleties worth not re-discovering
 
-PDF (`pypdf`), DOCX (`python-docx`), and a hardened HTML path (`selectolax`).
-The sniffer already recognises PDF and DOCX and the upload endpoint refuses them
-with "not yet supported", so M3b is a parser registry entry plus its tests.
+- **`defusedxml` is load-bearing, and the test that proves it is fragile.**
+  Stdlib `ElementTree` also raises on an *undefined* entity, so a test that only
+  asserts "some error" would still pass with `defusedxml` removed. The entity
+  tests assert `details["reason"] == "EntitiesForbidden"` for that reason.
+- **A ZIP magic number identifies the container, never the payload.** DOCX,
+  XLSX, PPTX and JAR are byte-identical at the front, so the parser verifies
+  `word/document.xml` exists rather than trusting the sniffer.
+- **Zip limits are checked against the central directory *and* on read.** The
+  directory is metadata the attacker writes, so its declared sizes can be a lie;
+  the bounded read is what holds when they are.
+- **`anyio.fail_after` cannot cancel a thread.** A genuinely hung parse fails
+  its job on time and leaves a thread running. The page and expansion caps are
+  the real defence; a process pool is the complete fix and is deferred.
+- **No `python-docx`.** It hands XML to `lxml` with entity expansion on and does
+  no decompression accounting, so it would have meant doing the hardening anyway
+  *and* trusting its parser. `zipfile` + `defusedxml` keeps every limit visible.
+- **PyMuPDF is AGPL** — it would reach this whole codebase, which is MIT and
+  meant to be published. That is why `pypdf` is used despite being slower.
 
-The security work is the substance, not the parsing: DOCX is zip + XML, so
-`defusedxml` and a decompression-ratio cap are mandatory rather than optional,
-and both formats need element and page caps under the existing parse timeout.
-That is the first code in this system to process genuinely hostile binary input.
+## Next: M4 — the model service
+
+BGE-M3 embeddings and a reranker on the GPU, reached over HTTP so the API and
+worker stay CPU-only (docs/adr/0004). It replaces `HeuristicTokenCounter` with
+the real tokenizer, which is when `chunks.token_count` stops being an estimate.
 
 Add new permissions to `rag.domain.authz.MINIMUM_ROLE` rather than checking
 roles inline — the table is what makes "which endpoints can a viewer reach?"
