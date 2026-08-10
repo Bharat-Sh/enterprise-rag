@@ -1,15 +1,23 @@
 """Document parsers, one per content type.
 
-M3a covers the text formats, which need nothing but the standard library. PDF
-and DOCX arrive in M3b along with the dependencies they require — and with the
-hardening that parsing genuinely untrusted binary formats demands (XXE,
-decompression bombs, element caps), which is a body of work in its own right
-rather than a footnote to this one.
+The text formats need nothing but the standard library. PDF and DOCX need real
+libraries and, more importantly, real limits — they are the first code in this
+system to process genuinely hostile binary input. See docs/adr/0010.
 """
 
 from __future__ import annotations
 
-from rag.adapters.parsers.registry import PARSERS, parser_for
+from rag.adapters.parsers.docx import DocxParser
+from rag.adapters.parsers.pdf import PdfParser
+from rag.adapters.parsers.registry import ParserRegistry, build_registry
 from rag.adapters.parsers.text import HtmlParser, MarkdownParser, PlainTextParser
 
-__all__ = ["PARSERS", "HtmlParser", "MarkdownParser", "PlainTextParser", "parser_for"]
+__all__ = [
+    "DocxParser",
+    "HtmlParser",
+    "MarkdownParser",
+    "ParserRegistry",
+    "PdfParser",
+    "PlainTextParser",
+    "build_registry",
+]

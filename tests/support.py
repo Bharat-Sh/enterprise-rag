@@ -7,6 +7,9 @@ every secret scanner would be right to flag it.
 
 from __future__ import annotations
 
+import io
+import zipfile
+from collections.abc import Sequence
 from typing import Any
 
 from cryptography.hazmat.primitives import serialization
@@ -44,6 +47,126 @@ def public_pem(private_pem: str) -> str:
         )
         .decode("ascii")
     )
+
+
+def make_pdf(pages: Sequence[str]) -> bytes:
+    """A minimal, valid PDF containing one text block per page.
+
+    Generated rather than committed as a binary fixture. A checked-in PDF is
+    opaque in review, impossible to diff, and tempting to copy from somewhere
+    with unclear provenance; this is thirty lines that any reader can verify
+    produces exactly what the test claims.
+
+    Byte offsets in the cross-reference table are computed as the file is built,
+    because a wrong `xref` is precisely the kind of malformation that would make
+    a test pass or fail for reasons unrelated to what it is testing.
+    """
+    objects: list[bytes] = []
+
+    page_object_ids = [4 + index * 2 for index in range(len(pages))]
+    kids = " ".join(f"{object_id} 0 R" for object_id in page_object_ids)
+
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objects.append(f"<< /Type /Pages /Kids [{kids}] /Count {len(pages)} >>".encode())
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+    for index, text in enumerate(pages):
+        content = f"BT /F1 24 Tf 72 720 Td ({_escape_pdf_text(text)}) Tj ET".encode()
+        objects.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                f"/Resources << /Font << /F1 3 0 R >> >> "
+                f"/Contents {page_object_ids[index] + 1} 0 R >>"
+            ).encode()
+        )
+        objects.append(
+            b"<< /Length "
+            + str(len(content)).encode()
+            + b" >>\nstream\n"
+            + content
+            + b"\nendstream"
+        )
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+
+    xref_offset = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    ).encode()
+
+    return bytes(out)
+
+
+def _escape_pdf_text(text: str) -> str:
+    return text.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+
+
+#: The minimum set of parts a real DOCX carries. Only `word/document.xml` is
+#: read, but a fixture missing the rest would not resemble what Word produces.
+_DOCX_CONTENT_TYPES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/word/document.xml" ContentType="application/vnd'
+    '.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+    "</Types>"
+)
+
+_DOCX_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006'
+    '/relationships/officeDocument" Target="word/document.xml"/>'
+    "</Relationships>"
+)
+
+
+def docx_document_xml(paragraphs: Sequence[str]) -> str:
+    """WordprocessingML for a body of plain paragraphs."""
+    body = "".join(f"<w:p><w:r><w:t>{_escape_xml(text)}</w:t></w:r></w:p>" for text in paragraphs)
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{body}</w:body></w:document>"
+    )
+
+
+def _escape_xml(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def make_docx(
+    paragraphs: Sequence[str] | None = None,
+    *,
+    document_xml: str | None = None,
+    extra_parts: dict[str, bytes] | None = None,
+    omit_document: bool = False,
+) -> bytes:
+    """Build a DOCX in memory.
+
+    The keyword arguments exist so a security test can produce a *malformed*
+    one — a missing body part, an entity-expansion payload, a decompression
+    bomb — without hand-assembling a zip in every test.
+    """
+    body = document_xml if document_xml is not None else docx_document_xml(paragraphs or [])
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES)
+        archive.writestr("_rels/.rels", _DOCX_RELS)
+        if not omit_document:
+            archive.writestr("word/document.xml", body)
+        for name, content in (extra_parts or {}).items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
 
 
 def production_overrides(**extra: Any) -> dict[str, Any]:

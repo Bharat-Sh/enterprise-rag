@@ -43,7 +43,7 @@ from rag.domain.ingestion import ContentType
 from rag.domain.sniff import SNIFF_BYTES, sniff
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Collection, Sequence
 
     from rag.core.config import IngestionSettings
     from rag.domain.access import AuthenticatedPrincipal
@@ -77,10 +77,16 @@ class IngestionService:
         *,
         blobs: BlobStore,
         settings: IngestionSettings,
+        supported_types: Collection[ContentType],
     ) -> None:
         self._uow = uow
         self._blobs = blobs
         self._settings = settings
+        # Injected rather than derived from an enum property. What this build
+        # can parse is a fact about the *adapters* wired into it, and a service
+        # may not import them — so a milestone-named `is_supported` on the enum
+        # would have been the domain asserting something it cannot know.
+        self._supported_types = frozenset(supported_types)
 
     async def upload(
         self,
@@ -256,10 +262,9 @@ class IngestionService:
                 details={"filename": filename},
             )
 
-        if not content_type.is_supported_in_m3a:
+        if content_type not in self._supported_types:
             raise UnsupportedMediaTypeError(
-                f"{content_type.value} files are recognised but not yet supported; "
-                f"parsing for them arrives in a later milestone.",
+                f"{content_type.value} files are recognised but this build has no parser for them.",
                 detected=content_type.value,
                 details={"filename": filename},
             )

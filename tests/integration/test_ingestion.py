@@ -169,15 +169,18 @@ class TestRejections:
         assert response.status_code == 415
         assert response.json()["code"] == "unsupported_media_type"
 
-    async def test_a_pdf_is_recognised_but_refused_until_m3b(
+    async def test_a_lying_content_type_is_ignored_in_favour_of_the_bytes(
         self, api_client: AsyncClient, tenant: Tenant, owner: User
     ) -> None:
-        """Two distinct refusals, and the difference matters to the caller.
+        """A PDF renamed and re-declared as plain text.
 
-        "We do not recognise this" and "we recognise it and cannot parse it
-        yet" are different messages; collapsing them would tell someone
-        uploading a valid PDF that their file is corrupt.
+        Now that PDF is parseable, the interesting assertion is stronger than a
+        refusal: the document is accepted and recorded as a PDF, so it reaches
+        the PDF parser. Trusting the declaration would have handed a binary to a
+        text decoder and produced mojibake chunks that look like success.
         """
+        from tests.support import make_pdf
+
         session = await _session(api_client, tenant, owner)
         collection_id = await _collection(api_client, session["access_token"])
 
@@ -185,31 +188,13 @@ class TestRejections:
             api_client,
             session["access_token"],
             collection_id,
-            content=b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\nbody",
-            filename="report.pdf",
-            content_type="application/pdf",
-        )
-
-        assert response.status_code == 415
-        assert response.json()["errors"]["detected_content_type"] == "application/pdf"
-
-    async def test_a_lying_content_type_does_not_get_a_text_parser(
-        self, api_client: AsyncClient, tenant: Tenant, owner: User
-    ) -> None:
-        # A PDF renamed and re-declared as plain text. The bytes decide.
-        session = await _session(api_client, tenant, owner)
-        collection_id = await _collection(api_client, session["access_token"])
-
-        response = await _upload(
-            api_client,
-            session["access_token"],
-            collection_id,
-            content=b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\nbody",
+            content=make_pdf(["Real PDF content."]),
             filename="notes.txt",
             content_type="text/plain",
         )
 
-        assert response.status_code == 415
+        assert response.status_code == 202
+        assert response.json()["mime_type"] == "application/pdf"
 
     async def test_an_oversized_upload_is_rejected(
         self, api_client: AsyncClient, api_settings: object, tenant: Tenant, owner: User
@@ -374,6 +359,123 @@ class TestPipeline:
         combined = " ".join(chunk["text"] for chunk in chunks)
         assert "Visible prose here." in combined
         assert "var x=1" not in combined
+
+    async def test_a_pdf_is_parsed_end_to_end(
+        self, api_client: AsyncClient, worker: Worker, tenant: Tenant, owner: User
+    ) -> None:
+        from tests.support import make_pdf
+
+        session = await _session(api_client, tenant, owner)
+        collection_id = await _collection(api_client, session["access_token"])
+        document_id = (
+            await _upload(
+                api_client,
+                session["access_token"],
+                collection_id,
+                content=make_pdf(["Annual leave is twenty-five days per year."]),
+                filename="handbook.pdf",
+                content_type="application/pdf",
+            )
+        ).json()["id"]
+
+        await worker.run_once()
+
+        document = (
+            await api_client.get(
+                f"/api/v1/documents/{document_id}", headers=bearer(session["access_token"])
+            )
+        ).json()
+        assert document["status"] == DocumentStatus.READY.value
+        assert document["mime_type"] == "application/pdf"
+
+        chunks = (
+            await api_client.get(
+                f"/api/v1/documents/{document_id}/chunks",
+                headers=bearer(session["access_token"]),
+            )
+        ).json()
+        assert "Annual leave" in " ".join(chunk["text"] for chunk in chunks)
+
+    async def test_a_docx_is_parsed_end_to_end(
+        self, api_client: AsyncClient, worker: Worker, tenant: Tenant, owner: User
+    ) -> None:
+        from tests.support import make_docx
+
+        session = await _session(api_client, tenant, owner)
+        collection_id = await _collection(api_client, session["access_token"])
+        document_id = (
+            await _upload(
+                api_client,
+                session["access_token"],
+                collection_id,
+                content=make_docx(["Expenses must be submitted within thirty days."]),
+                filename="policy.docx",
+                content_type=(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                ),
+            )
+        ).json()["id"]
+
+        await worker.run_once()
+
+        chunks = (
+            await api_client.get(
+                f"/api/v1/documents/{document_id}/chunks",
+                headers=bearer(session["access_token"]),
+            )
+        ).json()
+        assert "Expenses must be submitted" in " ".join(chunk["text"] for chunk in chunks)
+
+    async def test_a_malicious_docx_fails_the_document_not_the_worker(
+        self, api_client: AsyncClient, worker: Worker, tenant: Tenant, owner: User
+    ) -> None:
+        """The end-to-end shape of the hostile-input defence.
+
+        An entity-expansion payload is accepted at upload — it is a valid zip
+        with a `word/document.xml`, and the boundary cannot tell — and refused
+        by the parser. What matters is that the worker survives, the document is
+        marked `failed` with a reason, and the queue keeps moving.
+        """
+        from tests.support import make_docx
+
+        payload = (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            "<w:body><w:p><w:r><w:t>&xxe;</w:t></w:r></w:p></w:body></w:document>"
+        )
+        session = await _session(api_client, tenant, owner)
+        collection_id = await _collection(api_client, session["access_token"])
+        document_id = (
+            await _upload(
+                api_client,
+                session["access_token"],
+                collection_id,
+                content=make_docx(document_xml=payload),
+                filename="evil.docx",
+                content_type=(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                ),
+            )
+        ).json()["id"]
+
+        assert await worker.run_once() == 1
+
+        document = (
+            await api_client.get(
+                f"/api/v1/documents/{document_id}", headers=bearer(session["access_token"])
+            )
+        ).json()
+        assert document["status"] == DocumentStatus.FAILED.value
+        assert document["status_reason"]
+        # Nothing from the host filesystem became searchable.
+        chunks = (
+            await api_client.get(
+                f"/api/v1/documents/{document_id}/chunks",
+                headers=bearer(session["access_token"]),
+            )
+        ).json()
+        assert chunks == []
 
     async def test_a_document_with_no_extractable_text_fails_loudly(
         self, api_client: AsyncClient, worker: Worker, tenant: Tenant, owner: User

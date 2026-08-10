@@ -26,6 +26,7 @@ from rag.adapters.auth.keys import build_keyring
 from rag.adapters.auth.passwords import Argon2PasswordHasher
 from rag.adapters.auth.tokens import JwtTokenService
 from rag.adapters.blobs.filesystem import FilesystemBlobStore
+from rag.adapters.parsers import build_registry
 from rag.adapters.ratelimit.inprocess import InProcessRateLimiter
 from rag.api.errors import register_exception_handlers
 from rag.api.middleware import RequestContextMiddleware, TimingMiddleware
@@ -110,6 +111,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The S3 adapter will register one, because a remote store genuinely can be
     # down while the process is up.
     app.state.blob_store = FilesystemBlobStore(settings.ingestion.blob_root)
+    # Built once: the binary parsers hold configured limits, and constructing
+    # them per request would re-read configuration on the hot path.
+    app.state.parsers = build_registry(settings.ingestion)
 
     _log.info(
         "startup.complete",

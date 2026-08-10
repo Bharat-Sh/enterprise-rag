@@ -28,18 +28,6 @@ class ContentType(StrEnum):
     PDF = "application/pdf"
     DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-    @property
-    def is_supported_in_m3a(self) -> bool:
-        """Whether a parser exists yet.
-
-        PDF and DOCX are recognised by the sniffer from M3a but parsed only from
-        M3b. Recognising them early is what lets an upload be rejected with
-        "not supported yet" instead of being silently mis-parsed as text — a
-        binary run through a text decoder produces mojibake chunks that look
-        like successful ingestion.
-        """
-        return self in {ContentType.TEXT, ContentType.MARKDOWN, ContentType.HTML}
-
 
 @dataclass(frozen=True, slots=True)
 class ParsedDocument:

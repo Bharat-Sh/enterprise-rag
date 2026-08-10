@@ -83,6 +83,40 @@ class TestRecoveryPaths:
         assert can_transition(S.REINDEXING, S.READY)
 
 
+class TestTemporaryEdgeForM3:
+    """`CHUNKING -> READY` exists only until there is an index to fill.
+
+    The M3 pipeline stops at chunks: there is no embedding provider until M4 and
+    no vector store until M5, so a chunked document is as finished as one can
+    be, and without this edge nothing would ever reach `READY`.
+
+    **This is the failing test M5 is supposed to hit.** Once indexing exists, a
+    document that reaches `READY` without vectors is invisible to retrieval
+    while claiming to be searchable, and nothing errors — the worst failure
+    shape in the system. So the edge has to go, and this test exists to make
+    that a deliberate act rather than something nobody remembers to do.
+
+    A guarantee that is only written in a comment is not a guarantee, which is
+    the entire reason this is a test and not a `TODO`.
+    """
+
+    def test_the_edge_is_present(self) -> None:
+        assert can_transition(S.CHUNKING, S.READY), (
+            "The CHUNKING -> READY edge is missing. If this was removed as part "
+            "of M5, delete this whole test class too — its job is done."
+        )
+
+    def test_removing_it_is_the_only_thing_m5_has_to_change_here(self) -> None:
+        """Pins the shape of the edit, so it cannot quietly become a bigger one.
+
+        M5 deletes exactly one entry. The normal pipeline route through
+        `EMBEDDING` and `INDEXING` is already present and must survive.
+        """
+        assert can_transition(S.CHUNKING, S.EMBEDDING)
+        assert can_transition(S.EMBEDDING, S.INDEXING)
+        assert can_transition(S.INDEXING, S.READY)
+
+
 class TestInvariants:
     def test_every_status_has_an_entry(self) -> None:
         # A status missing from the table is silently un-transitionable, which

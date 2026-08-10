@@ -110,15 +110,15 @@ fixtures and fail in ways that look like real bugs.
 
 ## Current state
 
-**M0, M1, M2 and M3a complete.** Config, logging, request context, errors,
+**M0 through M3 complete.** Config, logging, request context, errors,
 liveness/readiness, Docker, CI (M0); schema, migrations, RLS, repositories,
 unit of work, job queue (M1); password and API-key auth, Ed25519 JWTs with JWKS,
 rotating refresh tokens, RBAC, per-tenant rate limiting, `rag-admin` (M2);
 upload, blob store, ingestion worker, chunking, document/collection endpoints,
-`rag-worker` (M3a).
+`rag-worker` (M3a); PDF and DOCX parsers with hostile-input hardening (M3b).
 
 Gate is green: ruff, `ruff format`, mypy strict, 3/3 import contracts,
-**584 tests** (unit + integration + security, against a real Postgres).
+**605 tests** (unit + integration + security, against a real Postgres).
 
 **Check CI, not just the local gate.** They diverged silently for two
 milestones: the tenant-isolation tests passed locally and failed on every CI run
@@ -225,16 +225,203 @@ Check `git remote -v` before assuming anything about the remote. The repo is
 - **Token counts are estimates until M4.** `tiktoken` was rejected: a precise
   count for a model we do not use is worse than an honest approximation.
 
-## Next: M3b — the remaining parsers
+### M3b subtleties worth not re-discovering
 
-PDF (`pypdf`), DOCX (`python-docx`), and a hardened HTML path (`selectolax`).
-The sniffer already recognises PDF and DOCX and the upload endpoint refuses them
-with "not yet supported", so M3b is a parser registry entry plus its tests.
+- **`defusedxml` is load-bearing, and the test that proves it is fragile.**
+  Stdlib `ElementTree` also raises on an *undefined* entity, so a test that only
+  asserts "some error" would still pass with `defusedxml` removed. The entity
+  tests assert `details["reason"] == "EntitiesForbidden"` for that reason.
+- **A ZIP magic number identifies the container, never the payload.** DOCX,
+  XLSX, PPTX and JAR are byte-identical at the front, so the parser verifies
+  `word/document.xml` exists rather than trusting the sniffer.
+- **Zip limits are checked against the central directory *and* on read.** The
+  directory is metadata the attacker writes, so its declared sizes can be a lie;
+  the bounded read is what holds when they are.
+- **No `python-docx`.** It hands XML to `lxml` with entity expansion on and does
+  no decompression accounting, so it would have meant doing the hardening anyway
+  *and* trusting its parser. `zipfile` + `defusedxml` keeps every limit visible.
+- **PyMuPDF is AGPL** — it would reach this whole codebase, which is MIT and
+  meant to be published. That is why `pypdf` is used despite being slower.
 
-The security work is the substance, not the parsing: DOCX is zip + XML, so
-`defusedxml` and a decompression-ratio cap are mandatory rather than optional,
-and both formats need element and page caps under the existing parse timeout.
-That is the first code in this system to process genuinely hostile binary input.
+## Known limitations
+
+Everything here is a **deliberate, known gap**, not a bug and not an oversight.
+Each entry says what breaks, why it is that way, and what the real fix is, so
+that none of it has to be reconstructed by reading the code. If you hit one of
+these, the decision has already been made — extend it or reverse it on purpose,
+do not "fix" it by accident.
+
+Ordered roughly by how likely you are to trip over it.
+
+### A hung parse leaks a thread
+
+**What happens.** `IngestionPipeline._parse` runs the parser under
+`anyio.fail_after(parse_timeout_seconds)` inside `anyio.to_thread.run_sync`.
+When the timeout fires, the *job* fails correctly and the worker moves on — but
+**Python cannot cancel a thread**. There is no interface for it and never has
+been. The thread keeps running whatever it was doing, holding its memory and
+burning a core, and for a genuine infinite loop it never stops. The worker
+process must be restarted to reclaim it.
+
+**Why it is like this.** The alternative is a `ProcessPoolExecutor`, where a
+hung child *can* be killed. That costs inter-process serialisation of every
+document body — real overhead on the hot path for a failure mode we have not yet
+observed — and adds a pool lifecycle to manage, supervise, and test.
+
+**What actually protects us instead.** The timeout is the backstop, not the
+defence. The defence is the caps in `IngestionSettings`, which bound the work
+before it can become unbounded: `max_pdf_pages`, `max_extracted_bytes`,
+`max_compression_ratio`, `max_archive_entries`. Those are why a hang is expected
+to be rare rather than routine. The blast radius is also already bounded: a
+worker runs **one job at a time**, so a leaked thread degrades one container
+that an orchestrator will restart, not a shared pool.
+
+**The real fix.** Move parsing to a process pool, or to a subprocess per
+document. Do it when a hang is *observed*, not on principle — and if you do,
+delete this entry rather than leaving it to rot.
+
+**Where to look.** `rag/services/pipeline.py::_parse`, `docs/adr/0010`.
+
+### The rate limiter is per worker process
+
+**What happens.** `InProcessRateLimiter` holds token buckets in memory. With N
+uvicorn worker processes, a tenant gets N times the configured allowance,
+because each process enforces the limit independently and none of them know
+about the others.
+
+**Why it is like this.** Redis is not a dependency until M9. Shipping nothing
+until then would have left `/auth/login` — the credential-stuffing surface, and
+the only unauthenticated write in the system — with no limit at all for seven
+milestones.
+
+**What contains it.** `ServerSettings.workers` defaults to **1**, and the
+deployment story is replica scaling, so the limit is exact locally and in a
+single-process container. It is approximate the moment there are several.
+
+**The real fix.** The M9 Redis adapter, behind the same `RateLimiter` port. No
+call site changes.
+
+**Where to look.** `rag/adapters/ratelimit/inprocess.py`, `docs/adr/0008`.
+
+### Access-token revocation has a one-second boundary
+
+**What happens.** `users.tokens_valid_after` rejects tokens issued before it.
+A JWT `iat` is a NumericDate and carries **whole seconds**, while the watermark
+has microsecond precision — so the comparison truncates, and a token minted in
+the *same second* as a revocation survives.
+
+**Why it is like this.** It is forced by the resolution of `iat`, not chosen.
+Comparing exactly would reject the replacement token that a password change
+hands back, making that flow return a pair that was already dead.
+
+**What is exact.** Refresh-token revocation, which is database rows, not a
+timestamp comparison. Password change and forced logout revoke both, so the
+window applies only to an access token already in flight, for under a second.
+
+**Where to look.** `User.accepts_token_issued_at`, `tests/unit/test_models.py`
+(the boundary is pinned there), `docs/adr/0007`.
+
+### The blob store is single-node
+
+**What happens.** `FilesystemBlobStore` writes to local disk. Two API replicas
+do not share one, so an upload handled by replica A and parsed by a worker on
+node B would not find its bytes.
+
+**Why it is like this.** There is no Docker on the primary dev machine, so MinIO
+cannot run here. Writing the `BlobStore` port first means S3 is one adapter and
+one wiring line rather than a refactor of every call site.
+
+**What contains it.** `docker/compose.yml` mounts one `blob-data` volume shared
+by the API and worker, so the containerised single-node setup is correct.
+
+**The real fix.** An S3-compatible adapter at deployment.
+
+**Where to look.** `rag/adapters/blobs/filesystem.py`, `docs/adr/0009`.
+
+### Orphan blobs accumulate
+
+**What happens.** Uploads write the blob *before* committing the document row
+(deliberately — see ADR-0009). If the commit then fails, the bytes stay on disk
+with nothing referencing them, forever. Nothing collects them.
+
+**Why it is like this.** The ordering is correct: the alternative is a job whose
+bytes do not exist, which is a user-visible failure rather than invisible
+garbage. Orphans are the cheaper mistake.
+
+**The real fix.** A sweep that lists blobs and deletes any with no matching
+`documents.blob_key`. Belongs in M12 with the ACL reconciliation job it
+resembles.
+
+### `CHUNKING → READY` must be removed in M5
+
+**What happens.** `rag.domain.state.ALLOWED_TRANSITIONS` currently permits a
+document to go straight from `CHUNKING` to `READY`, because the M3 pipeline
+stops at chunks — there is no embedding provider until M4 and no vector index
+until M5.
+
+**Why this is dangerous to leave.** Once indexing exists, a document that
+reaches `READY` without vectors is **invisible to retrieval while claiming to be
+searchable**, and nothing errors. That is the worst failure shape in the system.
+
+**What to do in M5.** Delete `S.READY` from the `S.CHUNKING` frozenset in
+`ALLOWED_TRANSITIONS`, then delete `TestTemporaryEdgeForM3` from
+`tests/unit/test_state.py`. That test class asserts the edge is *present*, so
+removing the edge fails it on purpose — it exists so this cannot be forgotten,
+and its failure message says as much.
+
+**Where to look.** `rag/domain/state.py::ALLOWED_TRANSITIONS`,
+`tests/unit/test_state.py::TestTemporaryEdgeForM3`.
+
+### Token counts are estimates until M4
+
+**What happens.** `chunks.token_count` and every chunk-size decision come from
+`HeuristicTokenCounter`, a character-ratio approximation, not from a tokenizer.
+
+**Why it is like this.** The tokenizer that matters is BGE-M3's, and it lives
+with the model service M4 introduces. `tiktoken` was rejected because a precise
+count for a model we do not use is worse than an honest approximation — it looks
+authoritative and is systematically wrong.
+
+**What it affects.** Chunk boundaries move slightly. Nothing budgets a context
+window against these numbers, which is the use that would not tolerate being
+approximate.
+
+**The real fix.** M4 swaps the `TokenCounter` implementation. No call sites
+change.
+
+### Parsing gaps
+
+- **No OCR.** A scanned PDF has no text layer, so it fails as "no extractable
+  text" rather than silently becoming a `READY` document with zero chunks.
+  Loud is correct; OCR is a separate service with a GPU budget.
+- **No PDF layout reconstruction.** Multi-column pages extract in content-stream
+  order, which is sometimes wrong. Fixing it properly means layout analysis.
+- **DOCX drops headers, footers, and footnotes.** Headers and footers are
+  usually a page number and a banner repeated on every page — noise that would
+  be embedded into every chunk, so losing them is closer to a feature.
+  **Footnotes are a genuine loss.** Tables *are* extracted.
+
+### Access-model gaps
+
+- **Flat groups only.** Nested groups need recursive expansion when building a
+  caller's principal set — a cheap Postgres recursive CTE, but scope we do not
+  need yet.
+- **No ACL reconciliation job.** A document's ACL lives in three places: the
+  `document_permissions` rows, the array on `documents`, and a copy on every
+  chunk. `set_acl` rewrites all three in one transaction, and a test asserts the
+  reprojection — but nothing detects drift if they ever diverge. M12.
+- **A suspended tenant can still write.** `TenantStatus.SUSPENDED` is documented
+  as "reads continue, writes stop", and login honours it, but no write path
+  checks it yet.
+- **`DOCUMENT_DELETE` is admin-only.** There is no per-document ownership model,
+  so a member cannot delete their own upload. Deliberate: adding ownership means
+  an owner check on every path, and it is one predicate to add later.
+
+## Next: M4 — the model service
+
+BGE-M3 embeddings and a reranker on the GPU, reached over HTTP so the API and
+worker stay CPU-only (docs/adr/0004). It replaces `HeuristicTokenCounter` with
+the real tokenizer, which is when `chunks.token_count` stops being an estimate.
 
 Add new permissions to `rag.domain.authz.MINIMUM_ROLE` rather than checking
 roles inline — the table is what makes "which endpoints can a viewer reach?"

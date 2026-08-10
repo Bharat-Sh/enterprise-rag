@@ -117,16 +117,3 @@ class TestEdges:
         assert len(head) > 4096
 
         assert sniff(head + b"\x00" * 10_000) is ContentType.TEXT
-
-
-class TestSupportedInM3a:
-    def test_text_formats_are_supported(self) -> None:
-        assert ContentType.TEXT.is_supported_in_m3a
-        assert ContentType.MARKDOWN.is_supported_in_m3a
-        assert ContentType.HTML.is_supported_in_m3a
-
-    def test_binary_formats_are_recognised_but_not_yet_supported(self) -> None:
-        # Recognised so an upload is refused with "not supported yet" rather
-        # than silently mis-parsed as text.
-        assert not ContentType.PDF.is_supported_in_m3a
-        assert not ContentType.DOCX.is_supported_in_m3a
