@@ -36,12 +36,14 @@ from rag.domain.enums import (
 )
 
 __all__ = [
+    "ApiKey",
     "Chunk",
     "Collection",
     "Document",
     "Group",
     "Job",
     "NewChunk",
+    "RefreshToken",
     "Tenant",
     "User",
 ]
@@ -82,10 +84,106 @@ class User:
     created_at: datetime
     updated_at: datetime
     last_login_at: datetime | None = None
+    #: Access tokens issued before this instant are rejected. Carried on the
+    #: entity — unlike `password_hash`, which is not — because it is read on
+    #: *every* authenticated request, and a second query per request to fetch one
+    #: nullable timestamp is a real cost. It is a timestamp, not a credential.
+    tokens_valid_after: datetime | None = None
 
     @property
     def can_authenticate(self) -> bool:
         return self.status is UserStatus.ACTIVE
+
+    def accepts_token_issued_at(self, issued_at: datetime) -> bool:
+        """Whether a token minted at `issued_at` is still honoured.
+
+        This is what makes a stateless token revocable. A password change, a
+        forced logout, or a detected refresh-token theft moves the watermark
+        forward and every outstanding token falls behind it at once.
+
+        **The watermark is truncated to whole seconds before comparing.** A JWT
+        `iat` is a NumericDate (RFC 7519) and therefore has one-second
+        resolution, while the watermark comes from `datetime.now()` and has
+        microseconds. Comparing them directly rejects the replacement token
+        issued *by* the revocation — a password change would hand back a pair
+        that was already dead, which is precisely the flow the feature exists to
+        support.
+
+        The cost is that the boundary is one second wide: a token minted in the
+        same second as the revocation survives. That is inherent to the
+        resolution of `iat`, not a choice, and one second is well inside the
+        window an attacker would need anyway.
+        """
+        if self.tokens_valid_after is None:
+            return True
+        return issued_at >= self.tokens_valid_after.replace(microsecond=0)
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKey:
+    """A machine credential belonging to a user (docs/adr/0007).
+
+    The secret itself is absent by construction — the row holds a SHA-256 and a
+    display prefix, so this object can be returned from any endpoint without
+    thinking about it.
+
+    **A key belongs to a user rather than standing alone.** A key with no user
+    could only ever match `role:` and `tenant:` document grants, because
+    `group_members` keys on `users.id` and the ACL model (docs/adr/0006) has no
+    service principal type. A machine credential that can read everything shared
+    organisation-wide but nothing shared with a team is the wrong default. The
+    price is that a key stops working when its owner is disabled — an ops
+    complaint, and also the correct behaviour.
+
+    `role` is a **ceiling**, never a grant: the request runs as
+    `less_privileged_of(user.role, key.role)`.
+    """
+
+    id: UUID
+    tenant_id: UUID
+    user_id: UUID
+    name: str
+    display_prefix: str
+    role: Role
+    created_at: datetime
+    created_by: UUID | None = None
+    expires_at: datetime | None = None
+    last_used_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+    def is_usable_at(self, now: datetime) -> bool:
+        """Whether the key may authenticate a request at `now`."""
+        if self.revoked_at is not None:
+            return False
+        return self.expires_at is None or self.expires_at > now
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshToken:
+    """A single-use handle for obtaining a new access token.
+
+    Opaque and database-backed rather than a JWT. Revoking a JWT refresh token
+    needs a denylist lookup, so you pay for statefulness either way — and this
+    way the token's validity *is* a row, which makes revocation exact instead of
+    eventually consistent.
+
+    `family_id` ties a rotation lineage together. Presenting a token that has
+    already been used means two parties hold it, which means one of them stole
+    it; the response is to revoke the whole family rather than to guess which.
+    """
+
+    id: UUID
+    tenant_id: UUID
+    user_id: UUID
+    family_id: UUID
+    issued_at: datetime
+    expires_at: datetime
+    used_at: datetime | None = None
+    revoked_at: datetime | None = None
+    replaced_by: UUID | None = None
+
+    def is_usable_at(self, now: datetime) -> bool:
+        return self.used_at is None and self.revoked_at is None and self.expires_at > now
 
 
 @dataclass(frozen=True, slots=True)

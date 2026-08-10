@@ -22,15 +22,23 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from rag import __version__
+from rag.adapters.auth.keys import build_keyring
+from rag.adapters.auth.passwords import Argon2PasswordHasher
+from rag.adapters.auth.tokens import JwtTokenService
+from rag.adapters.ratelimit.inprocess import InProcessRateLimiter
 from rag.api.errors import register_exception_handlers
 from rag.api.middleware import RequestContextMiddleware, TimingMiddleware
-from rag.api.v1.routers import health
+from rag.api.v1.routers import api_keys, auth, health, users, well_known
 from rag.core.config import Settings, get_settings
 from rag.core.health import HealthRegistry
 from rag.core.logging import configure_logging, get_logger
 from rag.db.session import create_engine, create_session_factory, ping
 
 _log = get_logger(__name__)
+
+#: Every product endpoint hangs off this. Health probes and the JWKS document
+#: deliberately do not — see `create_app`.
+API_V1_PREFIX = "/api/v1"
 
 
 @asynccontextmanager
@@ -42,9 +50,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     add their resources here and register the matching readiness check:
 
         M1  Postgres engine + session factory  -> health.register("postgres", ...)
+        M2  Signing keyring, hasher, limiter   -> no probe: all in-process
         M4  Model service HTTP client          -> health.register("model-service", ...)
         M5  Qdrant client                      -> health.register("qdrant", ...)
         M9  Redis client                       -> health.register("redis", required=False)
+
+    The M2 resources register no readiness check on purpose. They have no
+    network dependency and no failure mode after construction: a bad signing key
+    or an unreadable PEM raises here, at startup, which fails the process rather
+    than producing a service that is up and cannot authenticate anyone.
     """
     settings: Settings = app.state.settings
 
@@ -72,10 +86,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.health.register("postgres", check_postgres, timeout_seconds=2.0, required=True)
 
+    # Authentication resources. Built here rather than at import time so a test
+    # gets its own keyring — and so a missing or malformed signing key kills
+    # startup instead of surfacing as a 500 on the first login.
+    keyring = build_keyring(settings.auth)
+    app.state.keyring = keyring
+    app.state.token_service = JwtTokenService(keyring, settings.auth)
+    app.state.password_hasher = Argon2PasswordHasher(settings.auth)
+    app.state.rate_limiter = InProcessRateLimiter()
+
     _log.info(
         "startup.complete",
         health_checks=list(app.state.health.names),
         database=settings.database.safe_dsn,
+        signing_kid=keyring.signing_kid,
+        rate_limiting=settings.rate_limit.enabled,
     )
     try:
         yield
@@ -120,9 +145,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     register_exception_handlers(app, settings)
 
-    # Probes deliberately sit outside /api/v1 — they are infrastructure, not
-    # product API, and must not move when the API version changes.
+    # Probes and the JWKS document deliberately sit outside /api/v1 — they are
+    # infrastructure, not product API, and must not move when the API version
+    # changes. `/.well-known/` is additionally fixed by RFC 8615.
     app.include_router(health.router)
+    app.include_router(well_known.router)
+
+    app.include_router(auth.router, prefix=API_V1_PREFIX)
+    app.include_router(api_keys.router, prefix=API_V1_PREFIX)
+    app.include_router(users.router, prefix=API_V1_PREFIX)
 
     return app
 

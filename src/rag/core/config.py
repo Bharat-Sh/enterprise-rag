@@ -129,6 +129,98 @@ class QdrantSettings(BaseModel):
         return f"http://{self.host}:{self.port}"
 
 
+class SigningAlgorithm(StrEnum):
+    """JWS algorithm used to sign access tokens.
+
+    Defined here rather than in `rag.domain` because configuration must resolve
+    it at boot, and `rag.core` may not import our other packages.
+    """
+
+    #: Ed25519. No parameters to misconfigure, deterministic signatures, 64-byte
+    #: output. The default (docs/adr/0007).
+    EDDSA = "EdDSA"
+    #: Kept reachable by configuration for verifiers that cannot do EdDSA.
+    RS256 = "RS256"
+
+
+class AuthSettings(BaseModel):
+    """Token signing, password stretching, and credential lifetimes.
+
+    The signing key is deliberately *not* defaulted. In `local` a missing key
+    means "generate an ephemeral keypair at boot"; in staging or production it
+    is a boot-time failure (see `Settings._reject_insecure_production_defaults`).
+    Shipping a fixed development keypair in the repository was rejected: a
+    committed private key is eventually trusted by something real.
+    """
+
+    #: `iss` claim. A URL by OIDC convention, and the base of the JWKS location.
+    issuer: str = "http://localhost:8000"
+    #: `aud` claim. Verification requires an exact match — PyJWT silently skips
+    #: audience validation unless it is passed explicitly, so this is never None.
+    audience: str = "rag-api"
+    algorithm: SigningAlgorithm = SigningAlgorithm.EDDSA
+
+    #: PEM-encoded private key, or a path to one. `_pem` wins if both are set.
+    private_key_pem: SecretStr | None = None
+    private_key_path: str | None = None
+    #: Public keys of previously used signing keys, PEM-encoded. Tokens signed
+    #: with them still verify, which is what makes rotation a deploy rather than
+    #: a flag day: sign with the new key, keep verifying the old one until the
+    #: last token minted from it has expired, then drop it from this list.
+    retired_public_keys_pem: tuple[str, ...] = ()
+
+    #: Short, because an access token cannot be withdrawn once issued. The real
+    #: revocation control is `users.tokens_valid_after`, checked on every
+    #: request — this only bounds the window for a *deleted* user.
+    access_token_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
+    refresh_token_ttl_seconds: int = Field(default=2_592_000, ge=300)
+    #: Clock-skew tolerance on `exp`/`nbf`. Zero makes token validity depend on
+    #: NTP being perfect across every machine that verifies.
+    leeway_seconds: int = Field(default=30, ge=0, le=300)
+
+    # Argon2id, at the OWASP-recommended minimum rather than something heftier.
+    # Peak memory is `memory_cost * concurrent hashes`, and hashing runs in a
+    # thread pool 40 wide: 19 MiB gives ~760 MiB worst case, 64 MiB would give
+    # 2.5 GiB reachable from an unauthenticated endpoint.
+    argon2_time_cost: int = Field(default=2, ge=1, le=10)
+    argon2_memory_cost_kib: int = Field(default=19_456, ge=8_192)
+    argon2_parallelism: int = Field(default=1, ge=1, le=16)
+
+    #: Length, not composition rules. NIST 800-63B: complexity requirements push
+    #: users towards predictable substitutions and yield less entropy, not more.
+    password_min_length: int = Field(default=12, ge=8, le=256)
+
+    #: How long a granted API key may live when the caller names no expiry.
+    #: None means "until revoked".
+    api_key_default_ttl_days: int | None = Field(default=None, ge=1)
+
+    @property
+    def jwks_uri(self) -> str:
+        return f"{self.issuer.rstrip('/')}/.well-known/jwks.json"
+
+
+class RateLimitSettings(BaseModel):
+    """Token-bucket limits (docs/adr/0008).
+
+    Two buckets with different keys, because they defend different things. The
+    tenant bucket protects per-tenant capacity and cost; the login bucket
+    protects credentials, and cannot be keyed on a tenant that is not yet
+    verified.
+    """
+
+    enabled: bool = True
+
+    #: Steady-state rate for an authenticated tenant.
+    tenant_requests_per_minute: int = Field(default=600, ge=1)
+    #: Bucket capacity. Bursting is *desirable* — a page that fires six requests
+    #: on load is not abuse — so capacity exceeds one second's worth of refill.
+    tenant_burst: int = Field(default=120, ge=1)
+
+    #: Deliberately small: this is the credential-stuffing surface.
+    login_attempts_per_minute: int = Field(default=10, ge=1)
+    login_burst: int = Field(default=5, ge=1)
+
+
 class ModelServiceSettings(BaseModel):
     """The GPU model service serving BGE-M3 embeddings and reranking.
 
@@ -168,6 +260,8 @@ class Settings(BaseSettings):
     docs_enabled: bool | None = None
 
     server: ServerSettings = Field(default_factory=ServerSettings)
+    auth: AuthSettings = Field(default_factory=AuthSettings)
+    rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
@@ -213,6 +307,17 @@ class Settings(BaseSettings):
             problems.append("server.reload must be disabled")
         if self.docs_enabled is True:
             problems.append("docs_enabled was explicitly turned on")
+        if self.auth.private_key_pem is None and self.auth.private_key_path is None:
+            # Locally a missing key means "generate an ephemeral one"; every
+            # restart then invalidates outstanding tokens, which is fine. Doing
+            # that in production would sign tokens with a key no other replica
+            # holds and log everyone out on every deploy.
+            problems.append(
+                "auth.private_key_pem or auth.private_key_path must be set "
+                "(ephemeral signing keys are a local-development convenience only)"
+            )
+        if self.auth.issuer.startswith("http://"):
+            problems.append("auth.issuer must be https outside local development")
 
         if problems:
             joined = "; ".join(problems)

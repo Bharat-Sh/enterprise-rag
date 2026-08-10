@@ -4,9 +4,10 @@ A multi-tenant, production-shaped retrieval-augmented generation platform:
 documents in, grounded and cited answers out, with access control, evaluation,
 and observability treated as features rather than afterthoughts.
 
-> **Status: M1 — Data model and persistence.** The service boots, logs, fails
-> correctly, and now has a tenant-isolated schema with migrations, repositories,
-> a unit of work, and a job queue. Retrieval arrives in M5. Milestones below.
+> **Status: M2 — Authentication and RBAC.** The service boots, logs, fails
+> correctly, has a tenant-isolated schema, and is now closed: every endpoint
+> authenticates, and the row-level-security scope is bound from the verified
+> credential before any handler runs. Retrieval arrives in M5. Milestones below.
 
 ---
 
@@ -18,6 +19,7 @@ a RAG system deployable inside a company are the parts most demos skip:
 | Concern | How it is handled here |
 |---|---|
 | **Tenant isolation** | Access control is a *pre-filter pushed into the vector query*, never a filter applied to results after retrieval. Post-filtering both corrupts recall and means the data was already read. |
+| **Authentication** | The credential names its own tenant, and row-level security is bound from it *before* the credential is validated. A forged tenant finds zero rows rather than failing a comparison — the control that protects the data also protects the check that guards it. |
 | **Ingestion durability** | Documents move through an explicit state machine persisted in Postgres, with content-hash idempotency, bounded retries, and a dead-letter state. |
 | **Index rebuildability** | Postgres is the system of record; Qdrant is a derived index that can be dropped and rebuilt from it at any time. |
 | **Answer trust** | Every citation is validated against the actually-retrieved chunk set before it reaches the client. A claimed citation is worth nothing. |
@@ -30,7 +32,9 @@ rejected, and why — live in [`docs/adr/`](docs/adr/).
 ### Data model
 
 ```
-tenants ─┬─ users ──── group_members ──── groups
+tenants ─┬─ users ─┬─ group_members ──── groups
+         │         ├─ api_keys
+         │         └─ refresh_tokens
          ├─ collections ── documents ─┬─ chunks
          │                            └─ document_permissions
          └─ jobs   (no RLS — workers poll cross-tenant by design)
@@ -50,6 +54,57 @@ Within a tenant, document permissions are a flat `text[]` of principal tokens
 the GIN-indexed array-overlap operator `&&` — the exact semantics of Qdrant's
 `match_any`, so M5 enforces access with the same decision procedure rather than a
 similar-looking reimplementation. See [ADR-0006](docs/adr/0006-acl-projection.md).
+
+---
+
+## Authentication
+
+Two credential types, one `Authorization: Bearer` header, discriminated on a
+prefix:
+
+```
+eyJhbGciOiJFZERTQSIsImtpZCI6…   an access token — Ed25519, RFC 9068 shaped
+ragk_ndkbc5jzhffwbcbnasu6qnmhoe_kQ7t…   an API key — tenant, then 256-bit secret
+```
+
+Both name their own tenant, and that is the load-bearing design decision. Every
+table holding customer data is invisible until a transaction binds a scope, so
+validating a credential means reading rows that cannot be read until the tenant
+is known — and the credential is what knows it. The cycle is broken by binding
+the scope *from* the credential and validating it *under* that scope:
+
+```
+get_credential           header only, no I/O
+    ↓
+get_verified_credential  signature / alg / kid / typ / exp / aud / iss
+    ↓                    (or an API key's shape).  Yields a tenant id.
+    ↓
+get_unit_of_work         opens the transaction, binds RLS to that tenant
+    ↓
+get_principal            under that scope: user row, status, groups, key ceiling
+```
+
+Point a credential at another customer and the lookup returns nothing. No
+comparison rejects it; the absence of a row does. And because a transaction
+cannot be obtained without a verified tenant, an endpoint that forgets
+authentication does not compile — a test additionally walks every registered
+route and fails if one resolves no principal.
+See [ADR-0007](docs/adr/0007-token-bound-tenant-scope.md).
+
+| | |
+|---|---|
+| **Access tokens** | Ed25519 by default, `kid`-addressed with a JWKS at `/.well-known/jwks.json`, so rotation is a deploy rather than a flag day. RS256 is one config entry away for verifiers that need it. |
+| **What is in the token** | `iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`, `tid`. No role, no groups: both are read from the user's row on every request, so a demotion or a group change takes effect on the *next* request instead of at token expiry. |
+| **Revocation** | `users.tokens_valid_after` — a watermark, checked against `iat` on a row we already load. No denylist, no extra round trip. |
+| **Refresh tokens** | Opaque, database-backed, single use, rotating. Replaying a spent one means two parties hold it, so the whole rotation family is revoked and the access-token watermark moves. |
+| **Passwords** | Argon2id at the OWASP minimum, hashed in a thread. Unknown tenant, unknown user, and wrong password all cost one verification and return the identical 401 — a difference in any of the three is an enumeration oracle a stopwatch can read. |
+| **API keys** | SHA-256, not Argon2: the secret is 256 bits from a CSPRNG, so a slow hash buys nothing and puts 80 ms on the hottest auth path. A key belongs to a user and its role is a **ceiling** — applied before the `AccessFilter` is built, or it would narrow what the key may *call* while leaving what it may *read* untouched. |
+| **Roles** | OWNER > ADMIN > MEMBER > VIEWER, a total order. Permissions are a table in `rag.domain.authz`, gated at routes by `require(Permission.X)` — so "what can a viewer reach?" is a lookup, not a grep. |
+| **Rate limiting** | Token buckets: per tenant for authenticated traffic, per client address for login. In-process in M2 (so per worker — stated, not hidden), Redis-backed in M9 behind the same port. See [ADR-0008](docs/adr/0008-rate-limiting.md). |
+
+Cross-tenant lookups answer **404, never 403**. A 403 confirms the resource
+exists, which lets an attacker enumerate another customer's ids from status
+codes alone.
 
 ---
 
@@ -133,6 +188,30 @@ curl localhost:8000/ready    # readiness — can it serve traffic?
 open  localhost:8000/docs    # OpenAPI (disabled in production-like envs)
 ```
 
+### Getting a credential
+
+Every other endpoint needs one, and a fresh database has no tenant and no user.
+That first account is created from the command line, not from an endpoint: an
+unauthenticated tenant-creating route is a permanent liability guarded by a
+secret that is one empty environment variable away from being nothing.
+
+```bash
+uv run rag-admin create-tenant --slug acme --name "Acme Corp"
+uv run rag-admin create-user --tenant acme --email you@acme.example --role owner
+
+curl -s localhost:8000/api/v1/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"tenant_slug":"acme","email":"you@acme.example","password":"…"}'
+# → {"access_token":"eyJ…","refresh_token":"ragr_…", …}
+
+curl localhost:8000/api/v1/auth/me -H "Authorization: Bearer eyJ…"
+```
+
+`rag-admin generate-key` prints a signing key. Without one, local development
+generates an ephemeral keypair at boot and logs a warning — tokens then die on
+restart, which is why no key is committed here. In staging or production a
+missing key is a startup failure.
+
 Or run the whole stack in containers: `docker compose -f docker/compose.yml up -d --build`.
 
 ### Commands
@@ -161,7 +240,8 @@ Two properties worth knowing:
 - **Secrets are `SecretStr`.** They render as `**********` in reprs, tracebacks,
   and log dumps.
 - **Production-like environments fail fast.** Booting with `RAG_ENVIRONMENT=prod`
-  while still carrying the development database password raises at startup. A
+  while still carrying the development database password raises at startup — as
+  does a missing signing key or a plaintext `http://` issuer. A
   misconfiguration should be undeployable, not discovered in an audit.
 
 ---
@@ -206,7 +286,7 @@ caching but not correctness).
 |---|---|---|
 | M0 | Foundations — config, logging, errors, health, Docker, CI | **done** |
 | M1 | Data model — tenants, documents, chunks, jobs; RLS; migrations | **done** |
-| M2 | Auth & RBAC — JWT, roles, tenant scoping, rate limiting | next |
+| M2 | Auth & RBAC — JWT, API keys, roles, tenant scoping, rate limiting | **done** |
 | M3 | Ingestion — upload, job queue, parsing, chunking, state machine | |
 | M4 | Model service — BGE-M3 + reranker on GPU, batching | |
 | M5 | Dense retrieval — Qdrant, ACL pre-filter, `/search` | |

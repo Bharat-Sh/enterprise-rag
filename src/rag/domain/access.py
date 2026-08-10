@@ -33,12 +33,16 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Self
+from typing import TYPE_CHECKING, Self
 from uuid import UUID
 
 from rag.domain.enums import PrincipalType, Role
 
-__all__ = ["TENANT_WIDE", "AccessFilter", "Principal"]
+if TYPE_CHECKING:
+    from rag.domain.credentials import CredentialKind
+    from rag.domain.models import User
+
+__all__ = ["TENANT_WIDE", "AccessFilter", "AuthenticatedPrincipal", "Principal"]
 
 _SEPARATOR = ":"
 
@@ -148,5 +152,41 @@ class AccessFilter:
         The in-memory equivalent of Postgres `&&` and Qdrant `match_any`. Used
         in unit tests and defence-in-depth assertions; the real check always
         happens in the store, before rows or vectors are read.
+
+        A bare intersection, with no special case for an empty principal set.
+        An earlier version returned True when `principal_tokens` was empty,
+        which meant a directly constructed `AccessFilter` — the shape every test
+        fake and future system context produces — silently permitted
+        *everything*. `build()` can never produce an empty set, so the special
+        case protected nothing and only ever fired in the fail-open direction.
         """
-        return not self.principal_tokens or bool(set(acl_principals) & set(self.principal_tokens))
+        return bool(set(acl_principals) & set(self.principal_tokens))
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedPrincipal:
+    """Who is making this request, resolved from a verified credential.
+
+    Request-scoped rather than persisted, which is why it lives here beside
+    `AccessFilter` and not in `rag.domain.models`.
+
+    `effective_role` is not necessarily `user.role`. An API key carries a
+    ceiling, and the ceiling has to be applied *before* the access filter is
+    built — otherwise a key deliberately scoped down to viewer still carries the
+    `role:admin` principal and matches admin-granted document ACLs. Building the
+    filter from this object rather than from the user is what keeps the two
+    halves of the authorization decision consistent.
+    """
+
+    user: User
+    tenant_id: UUID
+    effective_role: Role
+    access: AccessFilter
+    credential: CredentialKind
+    #: Set only when the request authenticated with an API key. Used for audit
+    #: logging and to refuse account-level changes to a machine credential.
+    api_key_id: UUID | None = None
+
+    @property
+    def is_api_key(self) -> bool:
+        return self.api_key_id is not None

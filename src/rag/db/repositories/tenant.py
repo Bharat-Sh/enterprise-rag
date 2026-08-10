@@ -5,15 +5,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 
 from rag.db.models import CollectionORM, GroupMemberORM, GroupORM, TenantORM, UserORM
 from rag.domain.access import AccessFilter
 from rag.domain.enums import Role, UserStatus
+from rag.domain.errors import AlreadyExistsError, NotFoundError
 from rag.domain.models import Collection, Group, Tenant, User
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -95,8 +98,24 @@ class SqlAlchemyUserRepository:
             status=status or UserStatus.INVITED,
             password_hash=password_hash,
         )
-        self._session.add(orm)
-        await self._session.flush()
+        try:
+            # A SAVEPOINT, not a bare flush. Postgres aborts the whole
+            # transaction on a constraint violation, so without one this method
+            # could only report the conflict by destroying work the caller had
+            # already done in the same unit of work. `begin_nested` rolls back
+            # to the savepoint and leaves the outer transaction usable.
+            async with self._session.begin_nested():
+                self._session.add(orm)
+                await self._session.flush()
+        except IntegrityError as exc:
+            # Checking `get_by_email` first is not enough: two requests can both
+            # find nothing and both insert. The unique constraint is the only
+            # thing that can adjudicate, so the violation is translated here
+            # rather than surfacing as a 500 on a race.
+            raise AlreadyExistsError(
+                f"A user with the address {email!r} already exists in this tenant.",
+                details={"email": email},
+            ) from exc
         await self._session.refresh(orm)
         return orm.to_domain()
 
@@ -106,19 +125,77 @@ class SqlAlchemyUserRepository:
         )
         return tuple(result.scalars().all())
 
-    async def access_filter_for(self, user: User) -> AccessFilter:
+    async def access_filter_for(self, user: User, *, role: Role | None = None) -> AccessFilter:
         """Assemble the caller's full principal set for this request.
 
         Computed rather than stored. That is the whole reason a group membership
         change needs no re-indexing: the document's ACL is stable, and only the
         caller's side of the intersection moves.
+
+        `role` exists so an API key's ceiling reaches the filter. Passing
+        `user.role` when the request authenticated with a viewer-scoped key
+        would put `role:admin` in the principal set and match admin-granted
+        document ACLs — the narrowing would apply to route permissions and
+        silently not to data.
         """
         return AccessFilter.build(
             tenant_id=user.tenant_id,
             user_id=user.id,
-            role=user.role,
+            role=role if role is not None else user.role,
             group_ids=await self.group_ids_for(user.id),
         )
+
+    async def get_password_hash(self, user_id: UUID) -> str | None:
+        """Read the stored hash on its own.
+
+        Never carried on the `User` dataclass: a credential that only two call
+        sites need should not ride along on the object every handler, log line,
+        and response serialiser touches.
+        """
+        result = await self._session.execute(
+            select(UserORM.password_hash).where(UserORM.id == user_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def set_password_hash(self, user_id: UUID, password_hash: str) -> None:
+        await self._session.execute(
+            update(UserORM).where(UserORM.id == user_id).values(password_hash=password_hash)
+        )
+
+    async def touch_last_login(self, user_id: UUID, *, at: datetime) -> None:
+        await self._session.execute(
+            update(UserORM).where(UserORM.id == user_id).values(last_login_at=at)
+        )
+
+    async def invalidate_tokens_before(self, user_id: UUID, *, at: datetime) -> None:
+        """Reject every access token issued before `at`."""
+        await self._session.execute(
+            update(UserORM).where(UserORM.id == user_id).values(tokens_valid_after=at)
+        )
+
+    async def list_all(self, *, limit: int = 50, offset: int = 0) -> Sequence[User]:
+        result = await self._session.execute(
+            select(UserORM).order_by(UserORM.email).limit(limit).offset(offset)
+        )
+        return [orm.to_domain() for orm in result.scalars().all()]
+
+    async def set_role(self, user_id: UUID, role: Role) -> User:
+        orm = await self._session.get(UserORM, user_id)
+        if orm is None:
+            raise NotFoundError("User", str(user_id))
+        orm.role = role
+        await self._session.flush()
+        await self._session.refresh(orm)
+        return orm.to_domain()
+
+    async def set_status(self, user_id: UUID, status: UserStatus) -> User:
+        orm = await self._session.get(UserORM, user_id)
+        if orm is None:
+            raise NotFoundError("User", str(user_id))
+        orm.status = status
+        await self._session.flush()
+        await self._session.refresh(orm)
+        return orm.to_domain()
 
 
 class SqlAlchemyGroupRepository:

@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from rag.core.logging import get_logger
+from rag.db.repositories.auth import (
+    SqlAlchemyApiKeyRepository,
+    SqlAlchemyRefreshTokenRepository,
+)
 from rag.db.repositories.document import (
     SqlAlchemyChunkRepository,
     SqlAlchemyDocumentRepository,
@@ -28,6 +32,7 @@ from rag.db.repositories.tenant import (
     SqlAlchemyUserRepository,
 )
 from rag.db.session import set_tenant_scope
+from rag.domain import ports
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -53,6 +58,20 @@ class SqlAlchemyUnitOfWork:
     write still persists a partial change.
     """
 
+    # Declared at the *port* types rather than the concrete ones. Protocol
+    # attributes are invariant, so `api_keys: SqlAlchemyApiKeyRepository` would
+    # stop this class satisfying `ports.UnitOfWork` — and services, which accept
+    # only the port, could then never be handed the real thing.
+    tenants: ports.TenantRepository
+    users: ports.UserRepository
+    groups: ports.GroupRepository
+    collections: ports.CollectionRepository
+    documents: ports.DocumentRepository
+    chunks: ports.ChunkRepository
+    jobs: ports.JobRepository
+    api_keys: ports.ApiKeyRepository
+    refresh_tokens: ports.RefreshTokenRepository
+
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
         self._session: AsyncSession | None = None
@@ -69,6 +88,8 @@ class SqlAlchemyUnitOfWork:
         self.documents = SqlAlchemyDocumentRepository(session)
         self.chunks = SqlAlchemyChunkRepository(session)
         self.jobs = SqlAlchemyJobRepository(session)
+        self.api_keys = SqlAlchemyApiKeyRepository(session)
+        self.refresh_tokens = SqlAlchemyRefreshTokenRepository(session)
         return self
 
     async def __aexit__(
@@ -80,12 +101,11 @@ class SqlAlchemyUnitOfWork:
         if self._session is None:  # pragma: no cover - __aenter__ always sets it
             return
         try:
-            if exc is not None:
-                await self._session.rollback()
-            else:
-                # Roll back anything the caller did not explicitly commit.
-                # A no-op after commit(); a safety net otherwise.
-                await self._session.rollback()
+            # Unconditional, on both the clean and the failed path. On the way
+            # out of an exception it is the rollback; on a clean exit it discards
+            # anything the caller did not explicitly commit, which is what makes
+            # "no commit() means no write" true rather than merely intended.
+            await self._session.rollback()
         finally:
             await self._session.close()
             self._session = None
