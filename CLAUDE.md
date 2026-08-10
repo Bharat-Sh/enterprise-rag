@@ -78,6 +78,12 @@ of the local workflow.
 | Postgres | 16.14 native service `postgresql-x64-16`, auto-start, `127.0.0.1:5432` |
 | Credentials | role `rag` / password `rag`; databases `rag` (dev) and `rag_test` (suite) |
 | Superuser | `postgres` / `rag` — local dev only |
+
+**`rag` must stay a non-superuser.** It owns its tables, and `FORCE ROW LEVEL
+SECURITY` is the only thing stopping an owner from bypassing every policy.
+Granting it `SUPERUSER` or `BYPASSRLS` to fix a permissions problem would make
+the entire tenant-isolation suite vacuous while still passing — which is exactly
+how CI ran red for two milestones. Never run the suite as `postgres`.
 | GPU | NVIDIA (VRAM not yet confirmed — needed to size M4 defaults) |
 | `gh` CLI | installed, **not authenticated** |
 
@@ -108,7 +114,16 @@ unit of work, job queue (M1); password and API-key auth, Ed25519 JWTs with JWKS,
 rotating refresh tokens, RBAC, per-tenant rate limiting, `rag-admin` (M2).
 
 Gate is green: ruff, `ruff format`, mypy strict, 3/3 import contracts,
-**421 tests** (unit + integration + security, against a real Postgres).
+**423 tests** (unit + integration + security, against a real Postgres).
+
+**Check CI, not just the local gate.** They diverged silently for two
+milestones: the tenant-isolation tests passed locally and failed on every CI run
+from M1 onward, because the workflow's `POSTGRES_USER: rag` made the application
+role the cluster's bootstrap **superuser**, and a superuser bypasses row-level
+security unconditionally — `FORCE` does not apply to it. CI now creates `rag` as
+an ordinary owner role, and
+`TestThePreconditionEverythingElseRestsOn` fails in one legible line if that
+ever regresses. `gh run list --limit 3` after a push.
 
 Commits are authored as `122530216+Bharat-Sh@users.noreply.github.com` — keep it
 that way; the repo is intended to be public eventually and a real address in git

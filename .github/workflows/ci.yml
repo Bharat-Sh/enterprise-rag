@@ -20,23 +20,47 @@ jobs:
     # Integration tests auto-skip when no database is reachable, so without this
     # they would pass by not running — the worst kind of green build. The RLS
     # and SKIP LOCKED tests are the ones most worth having in CI.
+    # NOTE the superuser. `POSTGRES_USER` becomes the cluster's *bootstrap
+    # superuser*, and a superuser bypasses row-level security unconditionally —
+    # `FORCE ROW LEVEL SECURITY` does not apply to it. Running the suite as
+    # `rag` therefore made every tenant-isolation test pass through a connection
+    # that ignored RLS entirely, so they failed here while passing locally,
+    # where `rag` is an ordinary role.
+    #
+    # So the container keeps `postgres` as its superuser and the application
+    # role is created separately below, which reproduces the local and intended
+    # production shape: `rag` owns its tables and is held by FORCE.
     services:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: rag
-          POSTGRES_PASSWORD: rag
-          POSTGRES_DB: rag_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U rag -d rag_test"
+          --health-cmd "pg_isready -U postgres -d postgres"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
 
     steps:
       - uses: actions/checkout@v4
+
+      # Mirrors the developer machine described in CLAUDE.md: superuser
+      # `postgres`, ordinary role `rag` owning the database it uses. A test
+      # asserts the connecting role cannot bypass RLS, so if this step is ever
+      # removed the suite says so in one line instead of seventeen.
+      - name: Create the non-superuser application role
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE rag LOGIN PASSWORD 'rag' NOSUPERUSER NOCREATEDB NOBYPASSRLS;" \
+            -c "CREATE DATABASE rag_test OWNER rag;"
+          psql -h 127.0.0.1 -U postgres -d rag_test -v ON_ERROR_STOP=1 \
+            -c "GRANT ALL ON SCHEMA public TO rag;"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -93,34 +117,22 @@ jobs:
           RAG_TEST_DB_USER: rag
           RAG_TEST_DB_PASSWORD: rag
           RAG_TEST_DB_NAME: rag_test
-        run: uv run pytest --cov=rag --cov-report=term-missing --cov-report=xml
-
-      # Guards against the integration and security suites silently skipping in
-      # CI, which would turn a security regression into a passing build.
-      #
-      # `tests/security` gets the same treatment for a stronger reason: CLAUDE.md
-      # says those tests must never be skipped or marked xfail. Auto-skipping on
-      # an unreachable database is honest on a developer laptop and unacceptable
-      # here, where the database is a service container that is supposed to be up.
-      - name: Assert integration and security tests actually ran
-        env:
-          RAG_TEST_DB_HOST: 127.0.0.1
-          RAG_TEST_DB_PORT: "5432"
-          RAG_TEST_DB_USER: rag
-          RAG_TEST_DB_PASSWORD: rag
-          RAG_TEST_DB_NAME: rag_test
         run: |
-          for suite in integration security; do
-            echo "::group::$suite"
-            uv run pytest "tests/$suite" -q --no-header -p no:cacheprovider \
-              | tee "/tmp/$suite.log"
-            grep -qE '[0-9]+ passed' "/tmp/$suite.log"
-            if grep -qE '[0-9]+ skipped' "/tmp/$suite.log"; then
-              echo "::error::$suite tests were skipped — the database was unreachable."
-              exit 1
-            fi
-            echo "::endgroup::"
-          done
+          uv run pytest --cov=rag --cov-report=term-missing --cov-report=xml \
+            --junitxml=junit.xml
+
+      # Guards against the integration and security suites silently skipping,
+      # which would turn a data-leak regression into a green build. `tests/
+      # security` gets the same treatment for a stronger reason: CLAUDE.md says
+      # those must never be skipped or marked xfail.
+      #
+      # Asserts on the JUnit XML from the run above rather than re-running the
+      # suites, so the check covers the same run that produced the coverage and
+      # CI does not pay twice for the slowest suite. `if: always()` because a
+      # skipped suite is worth reporting even when something else failed.
+      - name: Assert integration and security tests actually ran
+        if: always()
+        run: uv run python scripts/assert_suites_ran.py junit.xml
 
       - name: Upload coverage
         if: always()

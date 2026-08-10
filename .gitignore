@@ -32,3 +32,4 @@ models/
 *.swp
 .DS_Store
 Thumbs.db
+junit.xml
