@@ -20,23 +20,47 @@ jobs:
     # Integration tests auto-skip when no database is reachable, so without this
     # they would pass by not running — the worst kind of green build. The RLS
     # and SKIP LOCKED tests are the ones most worth having in CI.
+    # NOTE the superuser. `POSTGRES_USER` becomes the cluster's *bootstrap
+    # superuser*, and a superuser bypasses row-level security unconditionally —
+    # `FORCE ROW LEVEL SECURITY` does not apply to it. Running the suite as
+    # `rag` therefore made every tenant-isolation test pass through a connection
+    # that ignored RLS entirely, so they failed here while passing locally,
+    # where `rag` is an ordinary role.
+    #
+    # So the container keeps `postgres` as its superuser and the application
+    # role is created separately below, which reproduces the local and intended
+    # production shape: `rag` owns its tables and is held by FORCE.
     services:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: rag
-          POSTGRES_PASSWORD: rag
-          POSTGRES_DB: rag_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U rag -d rag_test"
+          --health-cmd "pg_isready -U postgres -d postgres"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
 
     steps:
       - uses: actions/checkout@v4
+
+      # Mirrors the developer machine described in CLAUDE.md: superuser
+      # `postgres`, ordinary role `rag` owning the database it uses. A test
+      # asserts the connecting role cannot bypass RLS, so if this step is ever
+      # removed the suite says so in one line instead of seventeen.
+      - name: Create the non-superuser application role
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE rag LOGIN PASSWORD 'rag' NOSUPERUSER NOCREATEDB NOBYPASSRLS;" \
+            -c "CREATE DATABASE rag_test OWNER rag;"
+          psql -h 127.0.0.1 -U postgres -d rag_test -v ON_ERROR_STOP=1 \
+            -c "GRANT ALL ON SCHEMA public TO rag;"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

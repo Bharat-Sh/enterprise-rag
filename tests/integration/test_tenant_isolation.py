@@ -32,6 +32,56 @@ if TYPE_CHECKING:
 pytestmark = [requires_postgres, pytest.mark.integration]
 
 
+class TestThePreconditionEverythingElseRestsOn:
+    """The connecting role must not be able to bypass row-level security.
+
+    Every other test in this file is meaningless if it can. A **superuser
+    bypasses RLS unconditionally** — `FORCE ROW LEVEL SECURITY` does not apply
+    to it — so a suite run as one would exercise the policies against a
+    connection that ignores them, and report nothing unusual beyond a pile of
+    confusing failures.
+
+    That is exactly what happened: CI set `POSTGRES_USER: rag`, which the
+    postgres image makes the bootstrap superuser, and the isolation tests failed
+    there while passing locally for six weeks. This test turns that into one
+    legible line naming the cause.
+    """
+
+    async def test_the_connecting_role_cannot_bypass_rls(self, uow: SqlAlchemyUnitOfWork) -> None:
+        result = await uow.session.execute(
+            text("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
+        )
+        is_superuser, can_bypass = result.one()
+
+        assert not is_superuser, (
+            "The test database role is a SUPERUSER, which bypasses row-level "
+            "security unconditionally. Every isolation test below is vacuous. "
+            "Connect as an ordinary role that owns its tables — see the service "
+            "container setup in .github/workflows/ci.yml."
+        )
+        assert not can_bypass, (
+            "The test database role holds BYPASSRLS. Same consequence: the "
+            "policies are inert for this connection."
+        )
+
+    async def test_the_role_still_owns_its_tables(self, uow: SqlAlchemyUnitOfWork) -> None:
+        """Non-superuser is necessary but not sufficient — ownership matters too.
+
+        The application connects as the owner of its tables, which is precisely
+        why `FORCE` is required (docs/adr/0005). If the role were *not* the
+        owner, the tests would pass for the wrong reason and would stop
+        exercising FORCE at all.
+        """
+        result = await uow.session.execute(
+            text("SELECT tableowner = current_user FROM pg_tables WHERE tablename = 'users'")
+        )
+
+        assert result.scalar_one() is True, (
+            "The test role does not own `users`, so these tests no longer prove "
+            "that FORCE ROW LEVEL SECURITY holds the owner."
+        )
+
+
 class TestRowLevelSecurityReads:
     async def test_raw_sql_cannot_see_another_tenants_rows(
         self,
