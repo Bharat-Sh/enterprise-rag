@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
 #
-# Multi-stage build for the API (and, later, the ingestion worker — same image,
-# different CMD). The model service gets its own CUDA-based Dockerfile in M4;
-# this image stays CPU-only and small.
+# Multi-stage build for the API and the ingestion worker — same image, different
+# CMD (`rag-worker`). The model service gets its own CUDA-based Dockerfile in
+# M4; this image stays CPU-only and small.
 
 # --------------------------------------------------------------------------
 # Stage 1 — builder: resolve dependencies into a self-contained virtualenv.
@@ -52,6 +52,19 @@ RUN groupadd --system --gid 1001 rag \
     && useradd --system --uid 1001 --gid rag --create-home --shell /usr/sbin/nologin rag
 
 COPY --from=builder --chown=rag:rag /opt/venv /opt/venv
+
+# Blob storage root (docs/adr/0009). Created here, owned by the app user,
+# because the container runs unprivileged and cannot create a directory under
+# `/app` at startup — which is exactly how the default `./var/blobs` failed this
+# image's smoke test.
+#
+# An absolute path outside the working directory, and declared a VOLUME, so it
+# is obvious that this data must outlive the container. The filesystem adapter
+# is single-node regardless: with more than one replica this needs to be a
+# shared volume, or the S3 adapter.
+ENV RAG_INGESTION__BLOB_ROOT=/var/lib/rag/blobs
+RUN mkdir -p "$RAG_INGESTION__BLOB_ROOT" && chown -R rag:rag /var/lib/rag
+VOLUME ["/var/lib/rag"]
 
 WORKDIR /app
 USER rag

@@ -78,6 +78,12 @@ services:
       RAG_MODEL_SERVICE__BASE_URL: http://model-service:8001
     ports:
       - "8000:8000"
+    volumes:
+      # Shared with the worker: the API writes uploaded bytes and the worker
+      # reads them back. With the filesystem adapter they *must* see the same
+      # storage, which is the single-node limitation ADR-0009 names — the S3
+      # adapter is what removes this coupling.
+      - blob-data:/var/lib/rag
     depends_on:
       postgres:
         condition: service_healthy
@@ -86,7 +92,36 @@ services:
       qdrant:
         condition: service_started
 
+  # Same image as the API, different command. Separate from it because parsing
+  # is blocking CPU work: running it in the API process would stall every
+  # concurrent request, and the two scale on different signals — ingestion is
+  # bursty, serving is not.
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    command: ["rag-worker"]
+    environment:
+      RAG_ENVIRONMENT: local
+      RAG_LOG_LEVEL: INFO
+      RAG_DATABASE__HOST: postgres
+      RAG_DATABASE__PASSWORD: rag
+      RAG_REDIS__HOST: redis
+      RAG_QDRANT__HOST: qdrant
+      RAG_MODEL_SERVICE__BASE_URL: http://model-service:8001
+    volumes:
+      - blob-data:/var/lib/rag
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # One job at a time per process, so scale by replica count. A worker that a
+    # malformed document kills takes one job with it rather than a batch.
+    deploy:
+      replicas: 1
+
 volumes:
   postgres-data:
   redis-data:
+  blob-data:
   qdrant-data:
