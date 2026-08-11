@@ -25,10 +25,21 @@ from rag import __version__
 from rag.adapters.auth.keys import build_keyring
 from rag.adapters.auth.passwords import Argon2PasswordHasher
 from rag.adapters.auth.tokens import JwtTokenService
+from rag.adapters.blobs.filesystem import FilesystemBlobStore
+from rag.adapters.parsers import build_registry
 from rag.adapters.ratelimit.inprocess import InProcessRateLimiter
 from rag.api.errors import register_exception_handlers
 from rag.api.middleware import RequestContextMiddleware, TimingMiddleware
-from rag.api.v1.routers import api_keys, auth, health, users, well_known
+from rag.api.middleware.body_limit import BodySizeLimitMiddleware
+from rag.api.v1.routers import (
+    api_keys,
+    auth,
+    collections,
+    documents,
+    health,
+    users,
+    well_known,
+)
 from rag.core.config import Settings, get_settings
 from rag.core.health import HealthRegistry
 from rag.core.logging import configure_logging, get_logger
@@ -95,6 +106,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.password_hasher = Argon2PasswordHasher(settings.auth)
     app.state.rate_limiter = InProcessRateLimiter()
 
+    # Blob storage. No readiness check: the filesystem adapter creates its root
+    # here and has no network dependency, so a failure is a startup failure.
+    # The S3 adapter will register one, because a remote store genuinely can be
+    # down while the process is up.
+    app.state.blob_store = FilesystemBlobStore(settings.ingestion.blob_root)
+    # Built once: the binary parsers hold configured limits, and constructing
+    # them per request would re-read configuration on the hot path.
+    app.state.parsers = build_registry(settings.ingestion)
+
     _log.info(
         "startup.complete",
         health_checks=list(app.state.health.names),
@@ -140,6 +160,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Middleware is applied bottom-up: the LAST one added is the OUTERMOST.
     # RequestContextMiddleware must therefore be added last, so the ids it binds
     # are already in place when TimingMiddleware writes its access log.
+    #
+    # The body limit sits inside the context middleware but outside routing, so
+    # an oversized upload is rejected while it streams — before Starlette has
+    # spooled it to disk — and the rejection still carries correlation ids.
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.ingestion.max_upload_bytes)
     app.add_middleware(TimingMiddleware)
     app.add_middleware(RequestContextMiddleware)
 
@@ -154,6 +179,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router, prefix=API_V1_PREFIX)
     app.include_router(api_keys.router, prefix=API_V1_PREFIX)
     app.include_router(users.router, prefix=API_V1_PREFIX)
+    app.include_router(collections.router, prefix=API_V1_PREFIX)
+    app.include_router(documents.router, prefix=API_V1_PREFIX)
 
     return app
 

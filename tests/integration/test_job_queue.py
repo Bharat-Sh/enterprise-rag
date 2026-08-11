@@ -172,12 +172,24 @@ class TestCompletionAndRetry:
         assert again.last_error == "boom"
 
     async def test_backoff_grows_and_is_capped(self) -> None:
-        assert backoff_delay(1) == timedelta(seconds=5)
-        assert backoff_delay(2) == timedelta(seconds=10)
-        assert backoff_delay(3) == timedelta(seconds=20)
+        """Pinned at the top of the jitter window, so the curve is the variable.
+
+        M3 made the delay jittered — without it, every job that failed on a
+        shared cause retries at the same instant and knocks the recovering
+        dependency over again. The ceiling is what this asserts.
+        """
+        top = {"jitter": lambda: 1.0}
+
+        assert backoff_delay(1, **top) == timedelta(seconds=5)
+        assert backoff_delay(2, **top) == timedelta(seconds=10)
+        assert backoff_delay(3, **top) == timedelta(seconds=20)
         # Capped, so a poisoned job still retries within an operator's
         # attention span rather than drifting out to hours.
-        assert backoff_delay(50) == timedelta(seconds=600)
+        assert backoff_delay(50, **top) == timedelta(seconds=600)
+
+    async def test_backoff_never_drops_below_half_the_ceiling(self) -> None:
+        # Jitter spreads the herd; it must not turn a backoff into a retry storm.
+        assert backoff_delay(3, jitter=lambda: 0.0) == timedelta(seconds=10)
 
     async def test_attempts_are_tracked_towards_exhaustion(
         self, uow: SqlAlchemyUnitOfWork, tenant: Tenant
@@ -267,6 +279,7 @@ class TestTransactionalEnqueue:
                 collection_id=collection.id,
                 title="Doomed",
                 source_uri="s3://bucket/doomed.pdf",
+                blob_key="test-blob-key",
                 content_hash="e" * 64,
                 mime_type="application/pdf",
                 size_bytes=10,
@@ -293,6 +306,7 @@ class TestTransactionalEnqueue:
                 collection_id=collection.id,
                 title="Kept",
                 source_uri="s3://bucket/kept.pdf",
+                blob_key="test-blob-key",
                 content_hash="f" * 64,
                 mime_type="application/pdf",
                 size_bytes=10,

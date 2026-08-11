@@ -5,6 +5,7 @@ The interesting method is `claim`. Everything else is bookkeeping.
 
 from __future__ import annotations
 
+import random
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -17,7 +18,7 @@ from rag.domain.enums import JobKind, JobStatus
 from rag.domain.models import Job
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,16 +29,29 @@ __all__ = ["SqlAlchemyJobRepository", "backoff_delay"]
 _BASE_BACKOFF_SECONDS = 5
 _MAX_BACKOFF_SECONDS = 600
 
+#: Fraction of the delay that is randomised. "Full jitter" — sampling uniformly
+#: across the whole window — spreads a thundering herd best, but makes the first
+#: retry occasionally near-instant, which is the opposite of backing off. Half
+#: the window keeps a guaranteed floor and still breaks up lockstep.
+_JITTER_FRACTION = 0.5
 
-def backoff_delay(attempts: int) -> timedelta:
-    """Delay before the next attempt: 5s, 10s, 20s, 40s ... capped at 10 min.
 
-    No jitter yet. It matters once many jobs fail simultaneously on a shared
-    cause (a dependency outage) and retry in lockstep, hammering the recovering
-    service. Added in M3 alongside the real worker; noted here so the omission
-    is a decision rather than an oversight.
+def backoff_delay(attempts: int, *, jitter: Callable[[], float] | None = None) -> timedelta:
+    """Delay before the next attempt: ~5s, 10s, 20s, 40s ... capped at 10 min.
+
+    **Jittered**, which M1 deferred to this milestone. Without it, every job
+    that failed on a shared cause — a dependency outage, an exhausted quota —
+    retries at the same instant, hammering the service just as it recovers and
+    knocking it over again. The synchronised herd is the failure mode; the
+    backoff curve alone does nothing about it.
+
+    `jitter` returns a value in [0, 1) and is injected so tests can pin it. The
+    default is `random.random()`, which is fine here: this is scheduling, not
+    security, and `secrets` would buy nothing for it.
     """
-    seconds = min(_BASE_BACKOFF_SECONDS * (2 ** max(attempts - 1, 0)), _MAX_BACKOFF_SECONDS)
+    ceiling = min(_BASE_BACKOFF_SECONDS * (2 ** max(attempts - 1, 0)), _MAX_BACKOFF_SECONDS)
+    sample = jitter() if jitter is not None else random.random()  # noqa: S311 - not cryptographic
+    seconds = ceiling * (1 - _JITTER_FRACTION) + ceiling * _JITTER_FRACTION * sample
     return timedelta(seconds=seconds)
 
 

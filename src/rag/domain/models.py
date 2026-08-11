@@ -223,7 +223,12 @@ class Document:
     tenant_id: UUID
     collection_id: UUID
     title: str
+    #: Provenance: where the bytes came from, for a human reading an audit log.
     source_uri: str
+    #: Location in the blob store. Opaque — its layout belongs to the adapter,
+    #: and a caller that parses it has taken a dependency on the storage
+    #: backend (docs/adr/0009).
+    blob_key: str
     content_hash: str
     mime_type: str
     size_bytes: int

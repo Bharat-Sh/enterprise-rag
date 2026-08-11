@@ -51,6 +51,19 @@ class Permission(StrEnum):
     USER_ASSIGN_ROLE = "user:assign_role"
     USER_SET_STATUS = "user:set_status"
 
+    COLLECTION_READ = "collection:read"
+    COLLECTION_CREATE = "collection:create"
+
+    DOCUMENT_READ = "document:read"
+    DOCUMENT_UPLOAD = "document:upload"
+    #: Admin rather than "the member who uploaded it". Per-document ownership
+    #: needs an owner check on every path and buys little while every member of
+    #: a tenant can already read the same documents; if it is wanted later it is
+    #: one predicate, and guessing now would cost more than it saves.
+    DOCUMENT_DELETE = "document:delete"
+    #: Granting access to a document is a different power from uploading one.
+    DOCUMENT_MANAGE_ACL = "document:manage_acl"
+
 
 #: Higher is more privileged. Spaced by ten so a role can be inserted between
 #: two existing ones without renumbering.
@@ -68,6 +81,14 @@ MINIMUM_ROLE: dict[Permission, Role] = {
     Permission.USER_CREATE: Role.ADMIN,
     Permission.USER_ASSIGN_ROLE: Role.OWNER,
     Permission.USER_SET_STATUS: Role.ADMIN,
+    Permission.COLLECTION_READ: Role.VIEWER,
+    Permission.COLLECTION_CREATE: Role.ADMIN,
+    # A viewer queries; a member contributes. That is the line the role names
+    # already draw, so upload is the first permission a viewer does not hold.
+    Permission.DOCUMENT_READ: Role.VIEWER,
+    Permission.DOCUMENT_UPLOAD: Role.MEMBER,
+    Permission.DOCUMENT_DELETE: Role.ADMIN,
+    Permission.DOCUMENT_MANAGE_ACL: Role.ADMIN,
 }
 
 

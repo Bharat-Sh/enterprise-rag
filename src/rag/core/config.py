@@ -221,6 +221,92 @@ class RateLimitSettings(BaseModel):
     login_burst: int = Field(default=5, ge=1)
 
 
+class IngestionSettings(BaseModel):
+    """Upload limits, blob storage, and chunking (docs/adr/0009)."""
+
+    #: Where the filesystem blob adapter writes. Replaced by an S3 adapter at
+    #: deployment; the `BlobStore` port means no call site changes.
+    blob_root: str = "./var/blobs"
+
+    #: Enforced *during* the upload stream, not after. Checking afterwards means
+    #: a 10 GB body has already been written to disk before it is rejected.
+    max_upload_bytes: int = Field(default=50 * 1024 * 1024, ge=1024)
+    #: Read size while streaming an upload. 1 MiB keeps the syscall count low
+    #: without holding a meaningful amount of the file in memory.
+    upload_chunk_bytes: int = Field(default=1024 * 1024, ge=4096)
+
+    #: Target chunk size. Chunks are the unit of retrieval, so this is the main
+    #: recall/precision dial — bigger chunks bury the answer, smaller ones lose
+    #: the context that makes it interpretable.
+    chunk_target_tokens: int = Field(default=512, ge=32, le=8192)
+    #: Overlap carried between adjacent chunks, so a passage split across a
+    #: boundary is still wholly present in one of them.
+    chunk_overlap_tokens: int = Field(default=64, ge=0)
+
+    #: Wall-clock ceiling on a single parse. A malformed file that sends a
+    #: parser into a loop must lose its job, not its worker.
+    parse_timeout_seconds: float = Field(default=120.0, gt=0)
+
+    # --- limits on hostile input (docs/adr/0010) --------------------------
+    #
+    # Parsing attacker-supplied binary formats is the largest attack surface in
+    # the system. These caps are what make "the parse timed out" rare rather
+    # than the only defence — a timeout still leaves a thread burning CPU,
+    # because Python cannot cancel one.
+
+    #: Pages read from a PDF. A thousand-page scan is a legitimate document and
+    #: also an excellent way to occupy a worker for an hour.
+    max_pdf_pages: int = Field(default=2000, ge=1)
+
+    #: Total bytes a container may expand to. A DOCX is a zip, and a few
+    #: kilobytes of zeroes compress to gigabytes — the classic decompression
+    #: bomb, which a size limit on the *upload* does nothing about.
+    max_extracted_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
+
+    #: Largest tolerated uncompressed:compressed ratio for a single entry.
+    #: Ordinary office documents sit under 20:1; a bomb is thousands to one.
+    max_compression_ratio: int = Field(default=200, ge=2)
+
+    #: Entries in a container. An archive with a million tiny files exhausts
+    #: time and memory without ever tripping a size limit.
+    max_archive_entries: int = Field(default=2000, ge=1)
+
+    @model_validator(mode="after")
+    def _overlap_must_be_smaller_than_the_chunk(self) -> IngestionSettings:
+        # Overlap >= target does not shrink the remaining text, so the splitter
+        # would never advance. Caught here rather than as a hang at runtime.
+        if self.chunk_overlap_tokens >= self.chunk_target_tokens:
+            raise ValueError(
+                f"chunk_overlap_tokens ({self.chunk_overlap_tokens}) must be smaller than "
+                f"chunk_target_tokens ({self.chunk_target_tokens}); otherwise chunking "
+                f"cannot make progress."
+            )
+        return self
+
+
+class WorkerSettings(BaseModel):
+    """The ingestion worker process."""
+
+    #: Identifies the process holding a job, for debugging a stuck queue.
+    #: Defaults to the hostname at startup.
+    name: str | None = None
+
+    #: How long to wait before polling again when the queue is empty. Polling
+    #: rather than LISTEN/NOTIFY: the latency is irrelevant for a pipeline whose
+    #: stages take seconds, and one fewer moving part is worth more than it.
+    poll_interval_seconds: float = Field(default=1.0, gt=0)
+
+    #: Claimed per poll. One, deliberately: a worker runs a single job at a time
+    #: so a document that kills the process takes one job with it, not a batch.
+    batch_size: int = Field(default=1, ge=1, le=32)
+
+    #: A job whose worker died is reclaimed after this long. Must exceed the
+    #: slowest realistic job, or a healthy worker's job is stolen mid-flight and
+    #: run twice.
+    stalled_after_seconds: float = Field(default=900.0, gt=0)
+    reap_interval_seconds: float = Field(default=60.0, gt=0)
+
+
 class ModelServiceSettings(BaseModel):
     """The GPU model service serving BGE-M3 embeddings and reranking.
 
@@ -262,6 +348,8 @@ class Settings(BaseSettings):
     server: ServerSettings = Field(default_factory=ServerSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
+    ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
+    worker: WorkerSettings = Field(default_factory=WorkerSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     qdrant: QdrantSettings = Field(default_factory=QdrantSettings)

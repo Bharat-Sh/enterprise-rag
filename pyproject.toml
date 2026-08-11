@@ -22,6 +22,17 @@ dependencies = [
     # argon2-cffi directly rather than passlib, which is unmaintained and whose
     # bcrypt backend broke outright against bcrypt>=4.1.
     "argon2-cffi>=23.1",
+    # Required by FastAPI to accept multipart/form-data uploads.
+    "python-multipart>=0.0.20",
+    # PDF text extraction. Pure Python, MIT. PyMuPDF is faster and pdfplumber
+    # gives better layout, but PyMuPDF is AGPL — which would reach this whole
+    # codebase, and this repository is MIT and intended to go public.
+    "pypdf>=5.1",
+    # Safe XML parsing for DOCX, which is a zip of XML. The stdlib parser
+    # expands internal entities, which is billion-laughs; `defusedxml` is the
+    # drop-in that does not. Not needed for HTML — `html.parser` has no entity
+    # expansion to disable.
+    "defusedxml>=0.7.1",
 ]
 
 [project.optional-dependencies]
@@ -33,12 +44,18 @@ dev = [
     "pytest-cov>=6.0",
     "httpx>=0.28",
     "import-linter>=2.1",
+    # defusedxml ships no inline types, and mypy runs strict.
+    "types-defusedxml>=0.7",
 ]
 
 [project.scripts]
 # Bootstrap and break-glass only. A fresh deployment has no tenant and no user,
 # and every endpoint requires a credential; something has to create the first one.
 rag-admin = "rag.cli:main"
+# The ingestion worker. A separate process from the API on purpose: parsing is
+# blocking CPU work, and running it in a request handler would stall every
+# concurrent request on that worker (CLAUDE.md non-negotiable #6).
+rag-worker = "rag.worker.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -159,13 +176,25 @@ forbidden_modules = [
     # choices, and belong to adapters.
     "jwt",
     "argon2",
+    # M3b: parsing libraries are vendor choices. The domain owns what a
+    # document *is*, never how a PDF is decoded.
+    "pypdf",
+    "defusedxml",
 ]
 
 [[tool.importlinter.contracts]]
 name = "Services depend on ports, never on concrete adapters"
 type = "forbidden"
 source_modules = ["rag.services"]
-forbidden_modules = ["rag.adapters", "rag.api", "rag.db", "jwt", "argon2"]
+forbidden_modules = [
+    "rag.adapters",
+    "rag.api",
+    "rag.db",
+    "jwt",
+    "argon2",
+    "pypdf",
+    "defusedxml",
+]
 
 [[tool.importlinter.contracts]]
 name = "Core is the base layer and depends on nothing of ours"

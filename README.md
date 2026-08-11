@@ -4,10 +4,10 @@ A multi-tenant, production-shaped retrieval-augmented generation platform:
 documents in, grounded and cited answers out, with access control, evaluation,
 and observability treated as features rather than afterthoughts.
 
-> **Status: M2 — Authentication and RBAC.** The service boots, logs, fails
-> correctly, has a tenant-isolated schema, and is now closed: every endpoint
-> authenticates, and the row-level-security scope is bound from the verified
-> credential before any handler runs. Retrieval arrives in M5. Milestones below.
+> **Status: M3 — Ingestion complete.** PDF, DOCX, HTML, Markdown and plain text
+> can be uploaded, stored, parsed, and chunked by a background worker, behind an
+> API where every endpoint authenticates and every query is tenant-scoped.
+> Retrieval arrives in M5. Milestones below.
 
 ---
 
@@ -38,6 +38,9 @@ tenants ─┬─ users ─┬─ group_members ──── groups
          ├─ collections ── documents ─┬─ chunks
          │                            └─ document_permissions
          └─ jobs   (no RLS — workers poll cross-tenant by design)
+
+raw bytes and extracted text live in a blob store, not in Postgres
+(docs/adr/0009); `documents.blob_key` points at them
 
 documents.status:  UPLOADED → QUEUED → PARSING → CHUNKING → EMBEDDING
                             → INDEXING → READY
@@ -105,6 +108,56 @@ See [ADR-0007](docs/adr/0007-token-bound-tenant-scope.md).
 Cross-tenant lookups answer **404, never 403**. A 403 confirms the resource
 exists, which lets an attacker enumerate another customer's ids from status
 codes alone.
+
+---
+
+## Ingestion
+
+Upload returns **202**, not 201. The document exists; it is not searchable yet.
+
+```
+POST /documents ──► stream ──► sha256 + size (limit enforced mid-stream)
+                       │
+                       ├─► BlobStore.put()                    ← blob first
+                       │
+                       └─► ONE TRANSACTION (ADR-0002):
+                             documents row (uploaded → queued)
+                             jobs row (ingest_document)
+
+rag-worker ──► claim(SKIP LOCKED) ──► parsing ──► chunking ──► ready
+                     │                    │           │
+                     │               to_thread   to_thread
+                     │               + timeout   + overlap
+                     └── failure ──► retry (jittered backoff) or failed
+```
+
+Every arrow is a compare-and-set, so two workers racing on one document means
+the loser raises rather than overwriting the winner's progress.
+
+| | |
+|---|---|
+| **Nothing parses in the API** | Parsing is blocking CPU work; doing it in a handler would stall every concurrent request on that process. A separate `rag-worker` process holds one job at a time, so a document that kills a parser costs one job rather than a batch. |
+| **The bytes decide the type** | `Content-Type` and the filename are caller-supplied. A zip renamed `.pdf` is detected as a zip — a parser chosen from a lie is a parser handed input it never expected. |
+| **Hostile input is bounded, not hoped about** | A DOCX is a zip of XML, so it arrives carrying a decompression bomb and entity expansion by default. Page caps, expansion budgets, compression-ratio limits, and `defusedxml` close each one explicitly. XXE is the serious one: a parser that resolves it makes `/etc/passwd` *searchable*. See [ADR-0010](docs/adr/0010-parsing-hostile-documents.md). |
+| **Size is enforced mid-stream** | Starlette spools the whole body to disk before a handler runs, so a check in the endpoint protects nothing. An ASGI middleware counts bytes as they arrive. |
+| **Blob first, then the transaction** | An orphan blob is inert and collectable; a job whose bytes do not exist is a user-visible failure. This inverts ADR-0001's ordering because a blob is *source* data, not derived. See [ADR-0009](docs/adr/0009-blob-storage.md). |
+| **Extracted text is kept** | So a change to chunking is a re-chunk, not a re-parse of every document ever ingested. |
+| **Re-upload is idempotent** | By content hash — 200 with the existing document, not a duplicate. Unless it previously failed, in which case it is requeued, because otherwise a user who retries after a fix gets a permanent no. |
+| **Redelivery is safe** | At-least-once delivery is real: the reaper requeues jobs whose worker died. Every stage is re-runnable, and a job redelivered after success completes rather than dead-lettering. |
+
+Chunking is recursive splitting on a separator hierarchy — paragraphs, then
+lines, then sentences, then words — packed to a token target with overlap, so
+boundaries land on the most meaningful break available. Offsets are tracked as
+spans into the original text and are exact, which is what a citation feature
+will need. Token counts are an honest estimate until M4 brings the real
+tokenizer; `tiktoken` was rejected as a precise measurement of the wrong model.
+
+Run it:
+
+```bash
+uv run rag-worker           # poll forever
+uv run rag-worker --once    # drain one batch and exit
+```
 
 ---
 
@@ -287,7 +340,8 @@ caching but not correctness).
 | M0 | Foundations — config, logging, errors, health, Docker, CI | **done** |
 | M1 | Data model — tenants, documents, chunks, jobs; RLS; migrations | **done** |
 | M2 | Auth & RBAC — JWT, API keys, roles, tenant scoping, rate limiting | **done** |
-| M3 | Ingestion — upload, job queue, parsing, chunking, state machine | |
+| M3a | Ingestion — upload, blob store, worker, chunking, state machine | **done** |
+| M3b | Parsers — PDF, DOCX, and hostile-input hardening | **done** |
 | M4 | Model service — BGE-M3 + reranker on GPU, batching | |
 | M5 | Dense retrieval — Qdrant, ACL pre-filter, `/search` | |
 | M6 | Hybrid retrieval — sparse vectors, reciprocal rank fusion | |

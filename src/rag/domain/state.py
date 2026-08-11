@@ -23,7 +23,16 @@ ALLOWED_TRANSITIONS: dict[S, frozenset[S]] = {
     S.UPLOADED: frozenset({S.QUEUED, S.FAILED, S.DELETING}),
     S.QUEUED: frozenset({S.PARSING, S.FAILED, S.DELETING}),
     S.PARSING: frozenset({S.CHUNKING, S.QUEUED, S.FAILED, S.DELETING}),
-    S.CHUNKING: frozenset({S.EMBEDDING, S.QUEUED, S.FAILED, S.DELETING}),
+    # `READY` is reachable directly from `CHUNKING` because the M3 pipeline
+    # stops at chunks: there is no embedding provider until M4 and no vector
+    # index until M5, so a chunked document is as finished as one can be.
+    #
+    # **M5 must remove this edge.** Once indexing exists, a document that
+    # reaches READY without vectors is invisible to retrieval while claiming to
+    # be searchable — the worst of both, because nothing errors. A test asserts
+    # this edge is present so that deleting it is a deliberate act with a
+    # failing test to update, not something that quietly never happens.
+    S.CHUNKING: frozenset({S.EMBEDDING, S.READY, S.QUEUED, S.FAILED, S.DELETING}),
     S.EMBEDDING: frozenset({S.INDEXING, S.QUEUED, S.FAILED, S.DELETING}),
     S.INDEXING: frozenset({S.READY, S.QUEUED, S.FAILED, S.DELETING}),
     # Terminal-but-revivable: a READY document can be rebuilt or removed.
