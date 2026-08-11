@@ -321,9 +321,15 @@ Check `git remote -v` before assuming anything about the remote. The repo is
   call phases — so `readouterr()` comes back empty and every assertion passes
   against nothing. `structlog.testing.capture_logs` is also wrong here: it
   replaces the processor chain, so it tests a pipeline production does not run.
-- **`assert_suites_ran.py` now has an `ALLOWED_SKIPS` allowlist.** Exactly one
-  entry, for an assertion that needs a real GPU backend. Stale entries fail the
-  build, so the list cannot quietly accumulate.
+- **`assert_suites_ran.py` now covers `tests/unit` too, and has an
+  `ALLOWED_SKIPS` allowlist.** It had guarded only integration and security, on
+  the assumption that unit tests never skip — which stopped being true the
+  moment `BgeTokenCounter` arrived with a `skipif` on a downloaded vocabulary.
+  The first green M4 run was quietly skipping eleven tests covering the class
+  that decides whether a chunk fits the model's window. CI now fetches
+  `tokenizer.json` (cached) and the guard notices if that ever stops. The
+  allowlist has exactly one entry, for an assertion needing a real GPU; stale
+  entries fail the build, so it cannot silently accumulate.
 - **`Dockerfile.api` stubs *both* packages** before installing dependencies.
   hatch builds `src/rag` and `src/model_service`, and a missing directory fails
   the build before a single dependency resolves. The tokenizer is fetched in the

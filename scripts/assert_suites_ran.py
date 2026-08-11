@@ -1,9 +1,10 @@
-"""Fail CI if the integration or security suites did not actually run.
+"""Fail CI if any suite did not actually run.
 
-Both suites skip themselves when no database is reachable. That is right on a
-developer laptop and unacceptable in CI, where the database is a service
-container that is supposed to be up — a silently skipped isolation suite turns a
-data-leak regression into a green build. CLAUDE.md additionally requires that
+Tests skip themselves when a dependency is unreachable or an artefact is
+missing. That is right on a developer laptop and unacceptable in CI, where the
+database is a service container that is supposed to be up and the artefacts are
+fetched by the workflow — a silently skipped isolation suite turns a data-leak
+regression into a green build. CLAUDE.md additionally requires that
 `tests/security` never be skipped at all.
 
 Reads the JUnit XML produced by the main test run rather than re-running
@@ -28,7 +29,15 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 #: Suites that must run, keyed by the `classname` prefix pytest gives them.
+#:
+#: `tests.unit` joined the list in M4. It had been left out as "unit tests never
+#: skip" — which stopped being true the moment `BgeTokenCounter` arrived with a
+#: `skipif` on a downloaded vocabulary. CI was quietly skipping eleven tests
+#: covering the class that decides whether a chunk fits the model's window, and
+#: the build was green. The workflow now fetches that file; this is what notices
+#: if it ever stops.
 REQUIRED: dict[str, str] = {
+    "tests.unit": "unit",
     "tests.integration": "integration",
     "tests.security": "security",
 }
@@ -97,8 +106,8 @@ def main(argv: list[str]) -> int:
         elif skips:
             print(
                 f"::error::The {name} suite skipped {len(skips)} test(s) — almost "
-                f"certainly an unreachable dependency. A skipped isolation suite "
-                f"is a green build that verified nothing."
+                f"certainly an unreachable dependency or a missing artefact. A "
+                f"skipped test is a green build that verified nothing."
             )
             for test_id in skips:
                 print(f"::error::  skipped: {test_id}")

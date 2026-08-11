@@ -139,6 +139,31 @@ jobs:
       #
       # Not a service container: the image would have to be built first, and
       # this is one Python process that starts in under a second.
+      # BGE-M3's vocabulary, so `BgeTokenCounter` is actually exercised here.
+      # Without it those tests skip, and the class production is meant to use —
+      # the one that decides whether a chunk fits the model's window — would be
+      # covered on developer machines and nowhere else.
+      #
+      # Cached, because it is 17 MB of a file that changes about never, and
+      # because reaching huggingface.co on every push makes an unrelated outage
+      # look like our bug. A fetch failure fails the step rather than silently
+      # dropping back to skipping: the `tests/unit` suite has no skip guard, so
+      # losing this coverage would otherwise be invisible.
+      - name: Cache the BGE-M3 tokenizer
+        uses: actions/cache@v4
+        with:
+          path: var/models
+          key: bge-m3-tokenizer-${{ hashFiles('scripts/fetch_models.py') }}
+
+      - name: Fetch the BGE-M3 tokenizer
+        run: |
+          if [ -f var/models/bge-m3/tokenizer.json ]; then
+            echo "restored from cache"
+          else
+            uv pip install huggingface-hub
+            uv run python scripts/fetch_models.py --tokenizer-only
+          fi
+
       #
       # Launched as `.venv/bin/rag-model-service`, **not** `uv run ...`, and that
       # matters. A backgrounded process survives for the rest of the job, so
