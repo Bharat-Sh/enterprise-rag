@@ -139,15 +139,22 @@ jobs:
       #
       # Not a service container: the image would have to be built first, and
       # this is one Python process that starts in under a second.
+      #
+      # Launched as `.venv/bin/rag-model-service`, **not** `uv run ...`, and that
+      # matters. A backgrounded process survives for the rest of the job, so
+      # `uv run` would leave a live `uv` holding the cache — and `setup-uv`'s
+      # post-job prune then hangs for five minutes and fails the build with
+      # every real step green. The console script has no uv in its process tree.
       - name: Start the model service (stub backend)
         env:
           MODEL_SERVICE_BACKEND: stub
           MODEL_SERVICE_LOG_LEVEL: WARNING
         run: |
-          uv run rag-model-service &
+          .venv/bin/rag-model-service &
+          echo $! > model-service.pid
           for attempt in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8001/ready > /dev/null 2>&1; then
-              echo "model service is ready"
+              echo "model service is ready (pid $(cat model-service.pid))"
               exit 0
             fi
             sleep 1
@@ -181,6 +188,19 @@ jobs:
       - name: Assert integration and security tests actually ran
         if: always()
         run: uv run python scripts/assert_suites_ran.py junit.xml
+
+      # Stopped explicitly rather than left to the runner. A background process
+      # that outlives the steps needing it is how the previous run failed: it
+      # was still holding the uv cache during post-job cleanup. `if: always()`
+      # so a failing test suite does not also leave this behind.
+      - name: Stop the model service
+        if: always()
+        run: |
+          if [ -f model-service.pid ]; then
+            kill "$(cat model-service.pid)" 2>/dev/null || true
+            rm -f model-service.pid
+          fi
+          pkill -f rag-model-service || true
 
       - name: Upload coverage
         if: always()

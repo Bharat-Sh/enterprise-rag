@@ -43,3 +43,6 @@ junit.xml
 
 # Default blob-store root for local development (RAG_INGESTION__BLOB_ROOT).
 var/
+
+# Transient PID file written by the CI step that starts the model service.
+model-service.pid
