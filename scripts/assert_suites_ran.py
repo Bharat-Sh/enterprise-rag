@@ -14,6 +14,11 @@ Why not grep the output for "N passed": pytest omits that summary line under
 `-q` when everything passes, so the grep matched nothing and the check reported
 failure on a perfectly good run. Counting elements is not sensitive to how
 pytest chooses to phrase itself.
+
+M4 added a narrow exception mechanism — see `ALLOWED_SKIPS`. It exists because
+one assertion genuinely cannot be made without a GPU, and a runner without one
+would otherwise force the choice between deleting the assertion and weakening
+this check for everything.
 """
 
 from __future__ import annotations
@@ -26,6 +31,24 @@ from pathlib import Path
 REQUIRED: dict[str, str] = {
     "tests.integration": "integration",
     "tests.security": "security",
+}
+
+#: Tests permitted to skip, keyed by `classname::name`, each with the reason.
+#:
+#: An allowlist rather than a relaxed rule, because "no skips" is what makes the
+#: check worth having and every exception should cost someone a line of
+#: justification here. M4 needed exactly one: an assertion that can only be made
+#: against a real GPU backend, on a runner that has no GPU (docs/adr/0011).
+#:
+#: Entries are also checked for *staleness* below. An allowlist that quietly
+#: accumulates ids for tests that no longer exist stops being a list of known
+#: exceptions and becomes a list of things nobody has looked at.
+ALLOWED_SKIPS: dict[str, str] = {
+    "tests.integration.test_model_service.TestTheTokenizersAgree"
+    "::test_a_real_service_shares_the_workers_vocabulary": (
+        "compares the model service's published tokenizer fingerprint against "
+        "the worker's; needs the GPU backend, and CI runs the stub"
+    ),
 }
 
 
@@ -46,21 +69,24 @@ def main(argv: list[str]) -> int:
     cases = ET.parse(report).getroot().iter("testcase")  # noqa: S314
 
     totals: dict[str, int] = dict.fromkeys(REQUIRED, 0)
-    skipped: dict[str, int] = dict.fromkeys(REQUIRED, 0)
+    unexpected_skips: dict[str, list[str]] = {prefix: [] for prefix in REQUIRED}
+    seen_ids: set[str] = set()
 
     for case in cases:
         classname = case.get("classname", "")
+        test_id = f"{classname}::{case.get('name', '')}"
+        seen_ids.add(test_id)
         for prefix in REQUIRED:
             if classname.startswith(prefix):
                 totals[prefix] += 1
-                if case.find("skipped") is not None:
-                    skipped[prefix] += 1
+                if case.find("skipped") is not None and test_id not in ALLOWED_SKIPS:
+                    unexpected_skips[prefix].append(test_id)
                 break
 
     failed = False
     for prefix, name in REQUIRED.items():
-        total, skips = totals[prefix], skipped[prefix]
-        print(f"{name}: {total} tests, {skips} skipped")
+        total, skips = totals[prefix], unexpected_skips[prefix]
+        print(f"{name}: {total} tests, {len(skips)} unexpected skips")
 
         if total == 0:
             print(
@@ -70,11 +96,22 @@ def main(argv: list[str]) -> int:
             failed = True
         elif skips:
             print(
-                f"::error::The {name} suite skipped {skips} test(s) — almost "
-                f"certainly an unreachable database. A skipped isolation suite "
+                f"::error::The {name} suite skipped {len(skips)} test(s) — almost "
+                f"certainly an unreachable dependency. A skipped isolation suite "
                 f"is a green build that verified nothing."
             )
+            for test_id in skips:
+                print(f"::error::  skipped: {test_id}")
             failed = True
+
+    # A stale allowlist is how a deliberate exception rots into an unnoticed
+    # one. If an id no longer exists the entry has outlived its justification
+    # and someone has to decide whether it is still needed.
+    stale = sorted(set(ALLOWED_SKIPS) - seen_ids)
+    if stale:
+        for test_id in stale:
+            print(f"::error::ALLOWED_SKIPS names a test that no longer exists: {test_id}")
+        failed = True
 
     return 1 if failed else 0
 

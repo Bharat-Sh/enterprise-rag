@@ -221,6 +221,24 @@ class RateLimitSettings(BaseModel):
     login_burst: int = Field(default=5, ge=1)
 
 
+class TokenizerKind(StrEnum):
+    """Which token counter sizes chunks (docs/adr/0011).
+
+    Explicit configuration rather than "use the real one if its file happens to
+    be present". A silent fallback would make chunk boundaries depend on the
+    contents of a directory: the same document ingested on two machines would
+    produce different chunks, with nothing logged and nothing failing.
+    """
+
+    #: Character-ratio approximation. No files, no dependencies, ~10% out.
+    HEURISTIC = "heuristic"
+    #: BGE-M3's real vocabulary, loaded from `tokenizer_path`. Exact, and the
+    #: same tokenizer the model service uses, so chunk sizes and the model's
+    #: window agree by construction. Requires the file — a missing one is a
+    #: startup failure, deliberately.
+    BGE_M3 = "bge-m3"
+
+
 class IngestionSettings(BaseModel):
     """Upload limits, blob storage, and chunking (docs/adr/0009)."""
 
@@ -242,6 +260,16 @@ class IngestionSettings(BaseModel):
     #: Overlap carried between adjacent chunks, so a passage split across a
     #: boundary is still wholly present in one of them.
     chunk_overlap_tokens: int = Field(default=64, ge=0)
+
+    #: Which tokenizer sizes those chunks. Defaults to the estimator so that a
+    #: fresh clone runs with no model download; production should set `bge-m3`.
+    #: Changing this on a corpus that has already been ingested requires a
+    #: re-chunk — the existing chunks were sized by the old counter.
+    tokenizer: TokenizerKind = TokenizerKind.HEURISTIC
+    #: Where `tokenizer.json` lives when `tokenizer` is `bge-m3`. Populated by
+    #: `scripts/fetch_models.py` and baked into the container image, so the
+    #: worker never reaches the network at startup to fetch a vocabulary.
+    tokenizer_path: str = "./var/models/bge-m3/tokenizer.json"
 
     #: Wall-clock ceiling on a single parse. A malformed file that sends a
     #: parser into a loop must lose its job, not its worker.
@@ -308,16 +336,50 @@ class WorkerSettings(BaseModel):
 
 
 class ModelServiceSettings(BaseModel):
-    """The GPU model service serving BGE-M3 embeddings and reranking.
+    """The *client's* view of the GPU model service (docs/adr/0004, 0011).
 
     Reached over HTTP so the API and ingestion workers stay CPU-only and
-    GPU-agnostic (docs/adr/0004).
+    GPU-agnostic. The service's own configuration lives with the service, in
+    `model_service.settings` — these are the knobs for talking to it.
     """
 
     base_url: str = "http://localhost:8001"
     timeout_seconds: float = Field(default=30.0, gt=0)
     # Model load takes 20-60s, so readiness must tolerate a cold start.
     startup_grace_seconds: float = Field(default=120.0, gt=0)
+
+    #: Shared secret sent as a bearer token. Unset locally; when set, the
+    #: service rejects requests without it. The model service is an unmetered
+    #: GPU for anyone who can reach it, and "it is on an internal network" is a
+    #: control owned by somebody else.
+    api_key: SecretStr | None = None
+
+    #: Retries for transient failures — connection errors, 502/503/504, 429.
+    #: Never for 4xx: a rejected batch is rejected identically the second time.
+    #:
+    #: Deliberately small. The job queue already retries with exponential
+    #: backoff at a much coarser grain, and stacking the two turns a 30-second
+    #: timeout into minutes of a worker held on a service that is down.
+    max_retries: int = Field(default=2, ge=0, le=5)
+    retry_backoff_seconds: float = Field(default=0.25, gt=0)
+
+    #: Texts per HTTP request. The service batches internally against a token
+    #: budget, so this is about payload size, not GPU efficiency: 1024-dim
+    #: vectors as JSON run roughly 20 KB each, so an unbounded list would build
+    #: a response of tens of megabytes in memory at both ends.
+    max_texts_per_request: int = Field(default=32, ge=1, le=512)
+
+    @property
+    def embed_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/v1/embed"
+
+    @property
+    def rerank_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/v1/rerank"
+
+    @property
+    def info_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/v1/info"
 
 
 class Settings(BaseSettings):

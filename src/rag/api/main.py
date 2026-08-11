@@ -26,6 +26,7 @@ from rag.adapters.auth.keys import build_keyring
 from rag.adapters.auth.passwords import Argon2PasswordHasher
 from rag.adapters.auth.tokens import JwtTokenService
 from rag.adapters.blobs.filesystem import FilesystemBlobStore
+from rag.adapters.models import HttpModelClient
 from rag.adapters.parsers import build_registry
 from rag.adapters.ratelimit.inprocess import InProcessRateLimiter
 from rag.api.errors import register_exception_handlers
@@ -65,6 +66,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         M4  Model service HTTP client          -> health.register("model-service", ...)
         M5  Qdrant client                      -> health.register("qdrant", ...)
         M9  Redis client                       -> health.register("redis", required=False)
+
+    The M4 client is marked **not required** for readiness. Retrieval needs it,
+    but M4 has no retrieval endpoint yet, and everything the API currently
+    serves — uploads, documents, collections, auth — works while the GPU box is
+    down. Pulling every API replica out of the load balancer because a model
+    service is restarting would convert a degraded feature into a total outage.
+    M6 flips this to required when there is an endpoint that cannot answer
+    without it.
 
     The M2 resources register no readiness check on purpose. They have no
     network dependency and no failure mode after construction: a bad signing key
@@ -115,18 +124,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # them per request would re-read configuration on the hot path.
     app.state.parsers = build_registry(settings.ingestion)
 
+    # No token counter here. Chunking happens in the worker, and loading a 17 MB
+    # vocabulary into a process that never tokenizes anything is pure cost.
+
+    # Opens no socket: httpx connects lazily. A model service that is down
+    # therefore shows up in the readiness body rather than preventing boot.
+    model_client = HttpModelClient(settings.model_service)
+    app.state.model_client = model_client
+    app.state.health.register(
+        "model-service",
+        model_client.ping,
+        # Generous relative to the 2s default: this crosses a network to a
+        # process that may be mid-batch on a GPU. A probe that times out while
+        # the service is merely busy reports an outage that is not happening.
+        timeout_seconds=5.0,
+        required=False,
+    )
+
     _log.info(
         "startup.complete",
         health_checks=list(app.state.health.names),
         database=settings.database.safe_dsn,
         signing_kid=keyring.signing_kid,
         rate_limiting=settings.rate_limit.enabled,
+        model_service=settings.model_service.base_url,
     )
     try:
         yield
     finally:
         # Runs on clean shutdown and on startup failure alike, so resource
         # teardown belongs here rather than after `yield` unguarded.
+        await model_client.aclose()
         await engine.dispose()
         _log.info("shutdown.complete")
 

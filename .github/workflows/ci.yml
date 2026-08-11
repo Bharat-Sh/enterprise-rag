@@ -48,6 +48,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Gate 0 — no source file is gitignored.
+      #
+      # M4 nearly shipped without `src/rag/adapters/models/`: `.gitignore`
+      # carried an unanchored `models/` for downloaded weights, which matches at
+      # any depth and silently swallowed the whole package. Everything worked on
+      # the machine that wrote it and the file simply would not have existed in
+      # the repository. Nothing else in the pipeline can catch that — the tests
+      # pass, because the tests run against the working tree.
+      # `__pycache__` is filtered out because it is *supposed* to be ignored and
+      # would otherwise bury the one line that matters under a hundred that do
+      # not — a check nobody can read is a check nobody acts on.
+      - name: No source file is gitignored
+        run: |
+          hidden=$(git ls-files --others --ignored --exclude-standard -- src/ tests/ scripts/ \
+                   | grep -v '__pycache__' || true)
+          if [ -n "$hidden" ]; then
+            echo "::error::These source files are ignored by .gitignore and would never be committed:"
+            echo "$hidden"
+            exit 1
+          fi
+          echo "no ignored source files under src/, tests/ or scripts/"
+
       # Mirrors the developer machine described in CLAUDE.md: superuser
       # `postgres`, ordinary role `rag` owning the database it uses. A test
       # asserts the connecting role cannot bypass RLS, so if this step is ever
@@ -108,6 +130,31 @@ jobs:
           uv run alembic upgrade head
           uv run alembic current
 
+      # The model service, on the STUB backend (docs/adr/0011). There is no GPU
+      # runner, but the thing worth testing across a process boundary is the
+      # *contract* — status codes, batching, connection reuse, the two ends
+      # agreeing on field names — and none of that needs a GPU. Without this the
+      # model-service integration module would skip, and `assert_suites_ran.py`
+      # would fail the build rather than let it pass silently.
+      #
+      # Not a service container: the image would have to be built first, and
+      # this is one Python process that starts in under a second.
+      - name: Start the model service (stub backend)
+        env:
+          MODEL_SERVICE_BACKEND: stub
+          MODEL_SERVICE_LOG_LEVEL: WARNING
+        run: |
+          uv run rag-model-service &
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8001/ready > /dev/null 2>&1; then
+              echo "model service is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "model service failed to become ready within 30s"
+          exit 1
+
       # Gate 5 — behaviour. Unit and integration together; the integration tests
       # run against the service container above.
       - name: Tests
@@ -117,6 +164,7 @@ jobs:
           RAG_TEST_DB_USER: rag
           RAG_TEST_DB_PASSWORD: rag
           RAG_TEST_DB_NAME: rag_test
+          RAG_TEST_MODEL_SERVICE_URL: http://127.0.0.1:8001
         run: |
           uv run pytest --cov=rag --cov-report=term-missing --cov-report=xml \
             --junitxml=junit.xml
@@ -181,3 +229,16 @@ jobs:
           docker logs rag-api
           docker rm -f rag-api
           exit 1
+
+      # The GPU image is *checked*, not built. A full build pulls torch and the
+      # bundled CUDA runtime — 5-7 GB on every push, for an image no CI runner
+      # can execute anyway, since there is no GPU to smoke-test it against.
+      #
+      # `--check` runs buildx's Dockerfile linter: syntax, stage references,
+      # unset variables, bad `COPY --from`. That catches the ways this file
+      # actually rots between the rare occasions someone builds it, at a cost of
+      # a couple of seconds. It does **not** prove the image builds — see
+      # docs/adr/0011 for why that is the accepted trade rather than an
+      # oversight.
+      - name: Check the model-service Dockerfile
+        run: docker buildx build --check -f docker/Dockerfile.model .

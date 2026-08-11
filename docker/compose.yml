@@ -120,8 +120,50 @@ services:
     deploy:
       replicas: 1
 
+  # The GPU model service (docs/adr/0004, docs/adr/0011). Behind a profile, so
+  # `docker compose up` on a machine with no GPU still brings up everything
+  # else — the API and worker treat it as an optional dependency and only
+  # retrieval needs it, which does not exist before M6.
+  #
+  #   docker compose -f docker/compose.yml --profile gpu up -d
+  #
+  # Weights are not in the image (2.3 GB, versioned independently of the code).
+  # Populate the volume first, from the repository root:
+  #
+  #   uv run python scripts/fetch_models.py --root ./var/models
+  #   docker run --rm -v enterprise-rag_model-data:/dst -v "$PWD/var/models:/src" \
+  #     alpine cp -r /src/. /dst/
+  model-service:
+    profiles: ["gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.model
+    restart: unless-stopped
+    environment:
+      MODEL_SERVICE_LOG_LEVEL: INFO
+      MODEL_SERVICE_DEVICE: cuda
+      # Conservative for a 6 GB card. Both models resident leave roughly 2.5 GB
+      # for activations, and attention memory is quadratic in sequence length —
+      # BGE-M3's full 8192 window does not fit and we have no use for it, since
+      # chunks target 512 tokens. See docs/adr/0011.
+      MODEL_SERVICE_MAX_SEQUENCE_TOKENS: "1024"
+      MODEL_SERVICE_MAX_BATCH_TOKENS: "8192"
+    ports:
+      - "8001:8001"
+    volumes:
+      - model-data:/opt/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
 volumes:
   postgres-data:
   redis-data:
   blob-data:
   qdrant-data:
+  # Model weights, kept out of the image so a code change does not reship 2.3 GB.
+  model-data:

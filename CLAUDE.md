@@ -55,7 +55,17 @@ How integration dependencies are provided, given no Docker on the dev machine
 | Postgres | native Windows install | GitHub Actions service container |
 | Qdrant (M5) | `qdrant-client` local mode (embedded, no server) | service container |
 | Redis (M9) | `fakeredis` | service container |
-| Model service (M4) | native Python + CUDA on the host GPU | skipped (no GPU runner) |
+| Model service (M4) | native Python + CUDA on the host GPU | **stub backend**, started by the workflow |
+
+The model service entry changed in M4. The plan was "skipped in CI"; what
+shipped is better. `MODEL_SERVICE_BACKEND=stub` serves the entire HTTP contract
+with deterministic fake vectors and no torch, so CI starts a real one and runs
+the integration module against it over a real socket. Only the forward pass is
+GPU-only. Start one locally the same way:
+
+```
+MODEL_SERVICE_BACKEND=stub uv run rag-model-service
+```
 
 `docker/` stays in the repo and stays correct — CI builds and smoke-tests the
 image on every push, so it cannot silently rot. It is simply never run here.
@@ -78,7 +88,7 @@ of the local workflow.
 | Postgres | 16.14 native service `postgresql-x64-16`, auto-start, `127.0.0.1:5432` |
 | Credentials | role `rag` / password `rag`; databases `rag` (dev) and `rag_test` (suite) |
 | Superuser | `postgres` / `rag` — local dev only |
-| GPU | NVIDIA (VRAM not yet confirmed — needed to size M4 defaults) |
+| GPU | **RTX 4050 Laptop, 6141 MiB VRAM, compute 8.9** — this is what sizes the M4 defaults; see docs/adr/0011 §3 |
 | `gh` CLI | installed and authenticated as `Bharat-Sh` |
 | Blob store | filesystem, `./var/blobs` (gitignored) — see docs/adr/0009 |
 
@@ -99,10 +109,17 @@ uv run mypy                  uv run lint-imports
 uv run pytest                uv run uvicorn rag.api.asgi:app --reload
 uv run rag-admin --help      # bootstrap: create-tenant, create-user, generate-key
 uv run rag-worker --once     # drain the ingestion queue and exit
+
+uv sync --extra gpu                              # torch + FlagEmbedding, GPU box only
+uv run python scripts/fetch_models.py            # weights + vocabulary (~2.3 GB)
+uv run python scripts/fetch_models.py --tokenizer-only   # ~17 MB, all the worker needs
+uv run rag-model-service                         # the GPU service, port 8001
 ```
 
-The full suite takes a little over two minutes, most of it Argon2 in the
-integration tests. `uv run pytest tests/unit` is seconds.
+The full suite takes two to four minutes depending on the machine, almost all of
+it Argon2 in the integration and security fixtures. `uv run pytest tests/unit` is
+seconds. M4's tests add about ten seconds in total — if the suite suddenly costs
+minutes more, the model service is not the reason to look at first.
 
 **Do not run two pytest invocations at once.** Every integration test truncates
 `rag_test` in its `db_engine` fixture, so concurrent runs delete each other's
@@ -110,15 +127,19 @@ fixtures and fail in ways that look like real bugs.
 
 ## Current state
 
-**M0 through M3 complete.** Config, logging, request context, errors,
+**M0 through M4 complete.** Config, logging, request context, errors,
 liveness/readiness, Docker, CI (M0); schema, migrations, RLS, repositories,
 unit of work, job queue (M1); password and API-key auth, Ed25519 JWTs with JWKS,
 rotating refresh tokens, RBAC, per-tenant rate limiting, `rag-admin` (M2);
 upload, blob store, ingestion worker, chunking, document/collection endpoints,
-`rag-worker` (M3a); PDF and DOCX parsers with hostile-input hardening (M3b).
+`rag-worker` (M3a); PDF and DOCX parsers with hostile-input hardening (M3b);
+the GPU model service, `EmbeddingProvider` and `Reranker` ports, the HTTP
+client, and the real BGE-M3 tokenizer (M4).
 
-Gate is green: ruff, `ruff format`, mypy strict, 3/3 import contracts,
-**605 tests** (unit + integration + security, against a real Postgres).
+Gate is green: ruff, `ruff format`, mypy strict, **5/5 import contracts**,
+**725 tests** (unit + integration + security, against a real Postgres and a
+stub-backed model service). One skip, allowlisted in
+`scripts/assert_suites_ran.py`: the assertion that needs a real GPU backend.
 
 **Check CI, not just the local gate.** They diverged silently for two
 milestones: the tenant-isolation tests passed locally and failed on every CI run
@@ -242,6 +263,72 @@ Check `git remote -v` before assuming anything about the remote. The repo is
   *and* trusting its parser. `zipfile` + `defusedxml` keeps every limit visible.
 - **PyMuPDF is AGPL** — it would reach this whole codebase, which is MIT and
   meant to be published. That is why `pypdf` is used despite being slower.
+
+### M4 subtleties worth not re-discovering
+
+- **`max_sequence_tokens` defaults to 1024, not BGE-M3's 8192.** Attention
+  memory is quadratic in sequence length, and with both models resident on a
+  6 GB card there is roughly 2.5 GB left for activations — a batch at 8192 is
+  nowhere near fitting. Chunks target 512 tokens, so nothing legitimate is
+  refused. A bigger card should raise it; that is why it is configuration.
+- **Over-length input is rejected, never truncated.** A truncated chunk yields a
+  vector that is structurally perfect and missing the end of the text: no error,
+  undetectable from outside, permanent once indexed. This is the single most
+  important behaviour in M4.
+- **The tokenizer runs in the worker, not over HTTP.** `chunk_text` calls
+  `count_tokens` per candidate span — hundreds of calls per document — so a
+  remote counter would mean hundreds of round trips *and* would force
+  `TokenCounter` to be async, dragging the thread hop into `rag.domain`.
+- **Selecting the tokenizer is explicit, never a fallback.** A missing
+  `tokenizer.json` under `RAG_INGESTION__TOKENIZER=bge-m3` is a startup failure.
+  Falling back to the estimator would make chunk boundaries depend on whether a
+  file happened to exist, so the same document would chunk differently on two
+  machines with nothing logged.
+- **`tokenizer_hash` in `/v1/info` is the mismatch detector.** Both ends load
+  the same file and digest its *bytes* (not the loaded object — `Tokenizer` has
+  no stable cross-version serialisation). If chunking and embedding ever
+  disagree about what a token is, comparing those two strings is how you find
+  out, and it is far from obvious where else to look.
+- **`model_service.tokenizer` and `rag.adapters.tokenize.bge` are duplicated on
+  purpose.** `model_service` may not import `rag.adapters` — that boundary is
+  what keeps torch out of the API — and twenty lines is cheaper than breaching
+  it. A unit test asserts the two produce identical counts.
+- **`StubBackend` is not a mock.** It is a real `InferenceBackend` with an
+  uninteresting model, so the route tests exercise real routing, validation,
+  batching and error mapping. It is safe to leave reachable because it is
+  self-identifying: `/v1/info` says `stub`, and that string lands in
+  `chunks.embedding_model` for every row it produces.
+- **The client fails closed; the rate limiter fails open.** Opposite choices for
+  opposite reasons. There is no degraded embedding — a document indexed with
+  placeholder vectors is unfindable while claiming to be searchable.
+- **Client retries are shallow (2) on purpose.** The job queue already retries
+  with exponential backoff, so deep retries multiply into a worker held for
+  minutes on a service that is down.
+- **4xx from the model service becomes a `DomainError`.** An over-length chunk
+  is wrong identically on every attempt, so the worker dead-letters it now
+  rather than burning five queue attempts. 401/403/501 become
+  `ConfigurationError`; 429/5xx become `DependencyUnavailableError`.
+- **The client checks the response length against the request length.** Fewer
+  embeddings than texts would attach every vector after the gap to the wrong
+  chunk — and retrieval keeps working, it just returns unrelated text.
+- **The model service must never log request text.** It is tenant-blind, so it
+  cannot make an access decision about a log line. Counts and token totals only;
+  error bodies carry positions, never content. Asserted by
+  `tests/security/test_model_service_privacy.py`.
+- **Testing that privacy rule needs `caplog`, not `capsys`.** `configure_logging`
+  installs a `StreamHandler` holding whichever `sys.stdout` existed when
+  `create_app` ran, and pytest swaps its capture buffer between the setup and
+  call phases — so `readouterr()` comes back empty and every assertion passes
+  against nothing. `structlog.testing.capture_logs` is also wrong here: it
+  replaces the processor chain, so it tests a pipeline production does not run.
+- **`assert_suites_ran.py` now has an `ALLOWED_SKIPS` allowlist.** Exactly one
+  entry, for an assertion that needs a real GPU backend. Stale entries fail the
+  build, so the list cannot quietly accumulate.
+- **`Dockerfile.api` stubs *both* packages** before installing dependencies.
+  hatch builds `src/rag` and `src/model_service`, and a missing directory fails
+  the build before a single dependency resolves. The tokenizer is fetched in the
+  builder stage and copied to `/opt/models` — **not** under `/var/lib/rag`,
+  which is a VOLUME and would shadow it at runtime.
 
 ## Known limitations
 
@@ -372,22 +459,76 @@ and its failure message says as much.
 **Where to look.** `rag/domain/state.py::ALLOWED_TRANSITIONS`,
 `tests/unit/test_state.py::TestTemporaryEdgeForM3`.
 
-### Token counts are estimates until M4
+### Token counts are estimates *unless configured otherwise*
 
-**What happens.** `chunks.token_count` and every chunk-size decision come from
-`HeuristicTokenCounter`, a character-ratio approximation, not from a tokenizer.
+**Resolved in M4, but not by default.** `BgeTokenCounter` exists and is exact.
+`IngestionSettings.tokenizer` still defaults to `heuristic`, so a fresh clone
+runs with no 17 MB download; the container image sets `bge-m3` because it bakes
+the vocabulary in.
 
-**Why it is like this.** The tokenizer that matters is BGE-M3's, and it lives
-with the model service M4 introduces. `tiktoken` was rejected because a precise
-count for a model we do not use is worse than an honest approximation — it looks
-authoritative and is systematically wrong.
+**What to do.** Production should set `RAG_INGESTION__TOKENIZER=bge-m3` and
+point `TOKENIZER_PATH` at a fetched `tokenizer.json`. Note that **changing this
+after ingesting anything requires a re-chunk** — existing chunks were sized by
+the other counter, and the two disagree by roughly 10%.
 
-**What it affects.** Chunk boundaries move slightly. Nothing budgets a context
-window against these numbers, which is the use that would not tolerate being
-approximate.
+**Why not just default to `bge-m3`.** It would make `uv run pytest` on a fresh
+clone fail on a missing file, and the estimator is genuinely adequate for the
+sizes involved. The failure mode being avoided — chunks silently over the
+model's window — is now caught anyway, because the service *rejects* over-length
+input rather than truncating it.
 
-**The real fix.** M4 swaps the `TokenCounter` implementation. No call sites
-change.
+### The GPU model service is not covered end to end by CI
+
+**What happens.** `model_service/flag.py` — the module that actually loads
+BGE-M3 and calls it — is never executed by CI, because there is no GPU runner.
+`docker/Dockerfile.model` is linted (`docker buildx build --check`) but never
+built, because a full build pulls torch and the bundled CUDA runtime on every
+push for an image no runner can execute.
+
+**Why it is like this.** GPU runners are not free and this is the one part of
+the system that genuinely needs specific hardware.
+
+**What contains it.** Everything above the model is covered on CPU, and covered
+for real rather than by mocking: `StubBackend` is a true implementation of
+`InferenceBackend`, CI starts an actual model-service process with it, and the
+integration suite hits it over a real socket. `flag.py` is deliberately kept
+thin — load, call, convert types — with every decision that could live in tested
+code pushed up into `app.py`, `batching.py` and `tokenizer.py`. The FlagEmbedding
+`device`/`devices` kwarg rename is handled by reading the signature rather than
+guessing, because that library is the most likely thing to move underneath us.
+
+**The real fix.** A self-hosted GPU runner, or a nightly job on the dev box.
+Worth it around M10, when the eval harness needs real vectors anyway.
+
+**Where to look.** `src/model_service/flag.py`, `docs/adr/0011` §10.
+
+### Cross-request micro-batching is deferred
+
+**What happens.** The model service serialises GPU access with one lock and
+sub-batches *within* a request. Two clients each sending one text get two
+forward passes, where a micro-batcher would have merged them into one.
+
+**Why it is like this.** ADR-0004 specified the micro-batcher; ADR-0011 defers
+it. A caller already sends many texts per request, which captures most of the
+win. The remainder shows up only under many small concurrent requests — query
+-time embedding, which does not exist before M6 — and building it now means
+tuning a `max_wait_ms` against a load shape nobody has measured.
+
+**What contains it.** The lock is released between batches, so a caller sending
+256 texts does not lock everyone else out for the duration; requests interleave
+at batch granularity.
+
+**The real fix.** Build it when M10's eval harness can measure the difference.
+
+### A second model-service worker will not fit
+
+**What happens.** Model weights are per process. `--workers 2` loads two copies
+into VRAM and the second one fails with an out-of-memory error on any card this
+fits on at all. There is deliberately no setting for it.
+
+**What to do instead.** Scale with GPUs, not with processes on one GPU. Same
+reasoning as `ServerSettings.workers` defaulting to 1 for the API, but here it
+is a hard physical limit rather than a preference.
 
 ### Parsing gaps
 
@@ -417,11 +558,20 @@ change.
   so a member cannot delete their own upload. Deliberate: adding ownership means
   an owner check on every path, and it is one predicate to add later.
 
-## Next: M4 — the model service
+## Next: M5 — the vector index
 
-BGE-M3 embeddings and a reranker on the GPU, reached over HTTP so the API and
-worker stay CPU-only (docs/adr/0004). It replaces `HeuristicTokenCounter` with
-the real tokenizer, which is when `chunks.token_count` stops being an estimate.
+Qdrant behind a `VectorStore` port, hybrid dense + sparse search with the ACL
+pre-filter pushed into the query (non-negotiable #4), and the ingestion pipeline
+finally gaining its `EMBEDDING` and `INDEXING` stages using the M4 ports that
+are already built and tested.
+
+**M5 must delete the `CHUNKING → READY` edge** from
+`rag.domain.state.ALLOWED_TRANSITIONS`, then delete `TestTemporaryEdgeForM3`
+from `tests/unit/test_state.py`. That test asserts the edge is *present*, so
+removing it fails on purpose — it exists so this cannot be forgotten. Also flip
+the `model-service` readiness check to `required=True` once an endpoint exists
+that cannot answer without it, and update
+`test_a_down_model_service_does_not_block_readiness`.
 
 Add new permissions to `rag.domain.authz.MINIMUM_ROLE` rather than checking
 roles inline — the table is what makes "which endpoints can a viewer reach?"
