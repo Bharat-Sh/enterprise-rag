@@ -83,35 +83,37 @@ class TestRecoveryPaths:
         assert can_transition(S.REINDEXING, S.READY)
 
 
-class TestTemporaryEdgeForM3:
-    """`CHUNKING -> READY` exists only until there is an index to fill.
+class TestReadyImpliesIndexed:
+    """The M3 shortcut is gone, and must not come back.
 
-    The M3 pipeline stops at chunks: there is no embedding provider until M4 and
-    no vector store until M5, so a chunked document is as finished as one can
-    be, and without this edge nothing would ever reach `READY`.
+    `TestTemporaryEdgeForM3` used to live here asserting that `CHUNKING -> READY`
+    was *present*, so that removing it would be a deliberate act with a failing
+    test to update rather than something nobody remembered to do. M5 removed the
+    edge; this class replaces it, asserting the opposite.
 
-    **This is the failing test M5 is supposed to hit.** Once indexing exists, a
-    document that reaches `READY` without vectors is invisible to retrieval
-    while claiming to be searchable, and nothing errors — the worst failure
-    shape in the system. So the edge has to go, and this test exists to make
-    that a deliberate act rather than something nobody remembers to do.
-
-    A guarantee that is only written in a comment is not a guarantee, which is
-    the entire reason this is a test and not a `TODO`.
+    Why it matters enough to keep a test after the fact: a document that reaches
+    `READY` without vectors is invisible to retrieval while claiming to be
+    searchable, and nothing errors anywhere. Now that the only route to `READY`
+    runs through `EMBEDDING` and `INDEXING`, "ready" means "there are vectors"
+    by construction. Re-adding the shortcut for a quick fix would silently
+    reintroduce the worst failure shape in the system.
     """
 
-    def test_the_edge_is_present(self) -> None:
-        assert can_transition(S.CHUNKING, S.READY), (
-            "The CHUNKING -> READY edge is missing. If this was removed as part "
-            "of M5, delete this whole test class too — its job is done."
+    def test_chunking_cannot_shortcut_to_ready(self) -> None:
+        assert not can_transition(S.CHUNKING, S.READY), (
+            "CHUNKING -> READY is back. A document can now reach READY with no "
+            "vectors, which makes it unfindable while reporting itself as "
+            "searchable. Route through EMBEDDING and INDEXING instead."
         )
 
-    def test_removing_it_is_the_only_thing_m5_has_to_change_here(self) -> None:
-        """Pins the shape of the edit, so it cannot quietly become a bigger one.
+    def test_the_only_route_to_ready_runs_through_indexing(self) -> None:
+        for state in S:
+            if state is not S.READY and can_transition(state, S.READY):
+                assert state in {S.INDEXING, S.REINDEXING}, (
+                    f"{state} can reach READY without indexing"
+                )
 
-        M5 deletes exactly one entry. The normal pipeline route through
-        `EMBEDDING` and `INDEXING` is already present and must survive.
-        """
+    def test_the_pipeline_route_survives(self) -> None:
         assert can_transition(S.CHUNKING, S.EMBEDDING)
         assert can_transition(S.EMBEDDING, S.INDEXING)
         assert can_transition(S.INDEXING, S.READY)

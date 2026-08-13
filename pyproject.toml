@@ -41,6 +41,12 @@ dependencies = [
     # megabytes, no torch. `transformers.AutoTokenizer` does the same job while
     # dragging torch into the CPU-only worker on most install paths.
     "tokenizers>=0.20",
+    # M5: the vector index. >=1.12 for the Query API (`query_points`, prefetch,
+    # server-side RRF) that M6's fusion needs — adopting the older `search` API
+    # now would mean rewriting the adapter one milestone later. The client also
+    # ships an embedded local mode, which is how the vector store is exercised
+    # on a machine with no Docker (CLAUDE.md).
+    "qdrant-client>=1.12",
 ]
 
 [project.optional-dependencies]
@@ -228,6 +234,10 @@ forbidden_modules = [
     # document *is*, never how a PDF is decoded.
     "pypdf",
     "defusedxml",
+    # M5: the domain owns what a vector *is* (`rag.domain.retrieval`), never how
+    # Qdrant serialises a filter. This is the contract that keeps `pgvector` a
+    # realistic swap rather than a rewrite — see ADR-0001's closing note.
+    "qdrant_client",
 ]
 
 [[tool.importlinter.contracts]]
@@ -242,6 +252,10 @@ forbidden_modules = [
     "argon2",
     "pypdf",
     "defusedxml",
+    # M5: `RetrievalService` and `IngestionPipeline` take the `VectorStore`
+    # port. A service that imported the Qdrant client would be a service that
+    # could only ever run against Qdrant.
+    "qdrant_client",
 ]
 
 [[tool.importlinter.contracts]]

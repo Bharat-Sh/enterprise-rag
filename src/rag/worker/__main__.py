@@ -69,6 +69,10 @@ async def _run(once: bool, name: str | None) -> int:
         await worker.run_forever()
         return 0
     finally:
+        # The worker owns an HTTP connection pool and, in local mode, a file
+        # lock on the vector store's directory. Both are released here so a
+        # restart does not fail on a lock the previous process never dropped.
+        await worker.aclose()
         await engine.dispose()
 
 

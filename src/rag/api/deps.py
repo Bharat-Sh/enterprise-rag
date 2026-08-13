@@ -47,8 +47,10 @@ from fastapi import Depends, Request
 from rag.adapters.auth.passwords import Argon2PasswordHasher
 from rag.adapters.auth.tokens import JwtTokenService
 from rag.adapters.blobs.filesystem import FilesystemBlobStore
+from rag.adapters.models import HttpModelClient
 from rag.adapters.parsers import ParserRegistry
 from rag.adapters.ratelimit.inprocess import InProcessRateLimiter
+from rag.adapters.vectorstore import QdrantVectorStore
 from rag.api.security import VerifiedCredentialDep
 from rag.core.config import Settings, get_settings
 from rag.core.context import set_tenant_id
@@ -62,6 +64,7 @@ from rag.domain.errors import AuthenticationError, PermissionDeniedError, RateLi
 from rag.domain.ratelimit import RateLimitDecision, RateLimitPolicy
 from rag.services.auth import AuthService
 from rag.services.ingestion import IngestionService
+from rag.services.retrieval import RetrievalService
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -211,16 +214,53 @@ def get_ingestion_service(
     blobs: BlobStoreDep,
     settings: SettingsDep,
     parsers: ParserRegistryDep,
+    vectors: VectorStoreDep,
 ) -> IngestionService:
     return IngestionService(
         uow,
         blobs=blobs,
         settings=settings.ingestion,
         supported_types=parsers.supported,
+        vectors=vectors,
     )
 
 
 IngestionServiceDep = Annotated[IngestionService, Depends(get_ingestion_service)]
+
+
+def get_model_client(request: Request) -> HttpModelClient:
+    model_client = getattr(request.app.state, "model_client", None)
+    if model_client is None:  # pragma: no cover - lifespan guarantees it
+        raise DependencyUnavailableError("model-service", "The model client was not initialised.")
+    return model_client  # type: ignore[no-any-return]
+
+
+def get_vector_store(request: Request) -> QdrantVectorStore:
+    store = getattr(request.app.state, "vector_store", None)
+    if store is None:  # pragma: no cover - lifespan guarantees it
+        raise DependencyUnavailableError("qdrant", "The vector store was not initialised.")
+    return store  # type: ignore[no-any-return]
+
+
+ModelClientDep = Annotated[HttpModelClient, Depends(get_model_client)]
+VectorStoreDep = Annotated[QdrantVectorStore, Depends(get_vector_store)]
+
+
+def get_retrieval_service(
+    uow: UnitOfWorkDep,
+    embeddings: ModelClientDep,
+    vectors: VectorStoreDep,
+) -> RetrievalService:
+    """Assemble the search path.
+
+    Takes `UnitOfWorkDep`, not the unscoped one, so a retrieval service cannot
+    be constructed without a verified tenant already bound to row-level
+    security — the same structural guarantee the rest of the API relies on.
+    """
+    return RetrievalService(uow, embeddings=embeddings, vectors=vectors)
+
+
+RetrievalServiceDep = Annotated[RetrievalService, Depends(get_retrieval_service)]
 
 
 def _auth_service(

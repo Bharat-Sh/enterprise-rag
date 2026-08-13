@@ -23,6 +23,7 @@ import socket
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import pytest
 from alembic import command
@@ -33,15 +34,18 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from model_service.backend import STUB_DIMENSIONS
 from rag.adapters.auth.passwords import Argon2PasswordHasher
 from rag.adapters.blobs.filesystem import FilesystemBlobStore
+from rag.adapters.vectorstore import QdrantVectorStore
+from rag.api.deps import get_vector_store
 from rag.api.main import create_app
 from rag.core.config import Environment, LogFormat, Settings
 from rag.db.session import create_session_factory
 from rag.db.uow import SqlAlchemyUnitOfWork
 from rag.domain.enums import Role, UserStatus
 from rag.worker.runner import Worker
-from tests.support import generate_private_pem
+from tests.support import StubEmbeddingProvider, generate_private_pem
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -60,6 +64,14 @@ TEST_DSN = (
 )
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# The vector index and the model service. Both fall back to something that works
+# with no Docker and no GPU — local-mode Qdrant, and the model service's stub
+# backend — so the suite is runnable on the primary development machine
+# (CLAUDE.md). CI supplies the real article for both.
+QDRANT_HOST = os.environ.get("RAG_TEST_QDRANT_HOST", "127.0.0.1")
+QDRANT_PORT = int(os.environ.get("RAG_TEST_QDRANT_PORT", "6333"))
+MODEL_SERVICE_URL = os.environ.get("RAG_TEST_MODEL_SERVICE_URL", "http://127.0.0.1:8001")
 
 #: Truncated between tests. Order is irrelevant given CASCADE, but TRUNCATE is
 #: used rather than DELETE precisely because it is not subject to row-level
@@ -235,6 +247,17 @@ def api_settings(tmp_path: Path) -> Settings:
             "argon2_memory_cost_kib": 8192,
         },
         ingestion={"blob_root": str(tmp_path / "blobs")},
+        # Points at whatever the `vector_store` fixture will use. The value here
+        # only matters for the store the *lifespan* builds, which every test
+        # replaces via `dependency_overrides`; in-memory keeps that one cheap
+        # and, crucially, lock-free.
+        qdrant={
+            "host": QDRANT_HOST,
+            "port": QDRANT_PORT,
+            "local_path": None if QDRANT_IS_SERVER else ":memory:",
+            "vector_size": STUB_DIMENSIONS,
+        },
+        model_service={"base_url": MODEL_SERVICE_URL},
     )
 
 
@@ -244,19 +267,92 @@ def blob_store(api_settings: Settings) -> FilesystemBlobStore:
     return FilesystemBlobStore(api_settings.ingestion.blob_root)
 
 
+# --- the vector index ------------------------------------------------------
+
+
+def _qdrant_reachable() -> bool:
+    try:
+        with socket.create_connection((QDRANT_HOST, QDRANT_PORT), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+QDRANT_IS_SERVER = _qdrant_reachable()
+
+
 @pytest.fixture
-def worker(session_factory: async_sessionmaker[AsyncSession], api_settings: Settings) -> Worker:
-    """An ingestion worker sharing the test database and blob root.
+async def vector_store(api_settings: Settings) -> AsyncIterator[QdrantVectorStore]:
+    """**One** vector store, shared by the worker and the application.
+
+    Two things force this to be a fixture rather than something each component
+    builds for itself.
+
+    *Local mode locks its storage.* A path-backed local client holds an
+    exclusive lock on its directory, so the worker and the API cannot each open
+    one. In-memory takes no lock but gives each client its own empty storage,
+    which would make an end-to-end test assert against a store nothing wrote to.
+    Either way, sharing one object is the only arrangement that works.
+
+    *Server when there is one.* CI runs a real Qdrant service container, and
+    that is where the payload indexes are real — the local client warns that
+    they have no effect. The tests are identical against both; only the backing
+    changes. So the same assertions that pass locally in seconds are the ones
+    verified against the real engine in CI.
+    """
+    settings = api_settings.qdrant.model_copy(
+        update={"collection": f"test_{uuid4().hex[:12]}"}
+        if QDRANT_IS_SERVER
+        # In-memory needs no unique name: each store is its own universe.
+        else {"local_path": ":memory:"}
+    )
+    store = QdrantVectorStore(settings)
+    await store.ensure_ready()
+    try:
+        yield store
+    finally:
+        if QDRANT_IS_SERVER:
+            # Collections outlive the process, unlike everything else here, so
+            # a run that did not clean up leaves the next one sharing a
+            # namespace with it.
+            await store.drop()
+        await store.aclose()
+
+
+@pytest.fixture
+def worker(
+    session_factory: async_sessionmaker[AsyncSession],
+    api_settings: Settings,
+    vector_store: QdrantVectorStore,
+) -> Worker:
+    """An ingestion worker sharing the test database, blob root and index.
 
     Driven with `run_once()` rather than `run_forever()`: a test that starts the
     loop and sleeps is slow and flaky, and the loop adds nothing to what is
     being asserted.
+
+    Both remote dependencies are *injected*. The vector store because a
+    local-mode Qdrant locks its storage (see the `vector_store` fixture); the
+    embedding provider because otherwise every ingestion test — which is about
+    parsing, chunking and the state machine — would need a model service
+    process running just to reach `READY`. `StubEmbeddingProvider` is the same
+    `StubBackend` CI serves over HTTP, called in process.
+
+    The real `HttpModelClient` is exercised against a live service in
+    `test_model_service.py` and `test_search.py`.
     """
-    return Worker(session_factory, api_settings)
+    return Worker(
+        session_factory,
+        api_settings,
+        vectors=vector_store,
+        embeddings=StubEmbeddingProvider(),
+    )
 
 
 @pytest.fixture
-async def api_app(db_engine: AsyncEngine, api_settings: Settings) -> AsyncIterator[FastAPI]:
+async def api_app(
+    db_engine: AsyncEngine, api_settings: Settings, vector_store: QdrantVectorStore
+) -> AsyncIterator[FastAPI]:
     """The real application, with lifespan run, against the truncated test database.
 
     Depends on `db_engine` for its truncation side effect, so each test starts
@@ -265,10 +361,19 @@ async def api_app(db_engine: AsyncEngine, api_settings: Settings) -> AsyncIterat
     Exposed separately from `api_client` because the security suite needs
     `app.state.token_service` to mint deliberately malformed tokens *with our
     own key* — a forgery that fails the signature check proves nothing.
+
+    The vector store is overridden onto the shared fixture, so a search sees
+    what the worker indexed. Done through `dependency_overrides` — the supported
+    seam — rather than by mutating `app.state`, so it also survives any future
+    change to how the dependency resolves.
     """
     app = create_app(api_settings)
     async with app.router.lifespan_context(app):
-        yield app
+        app.dependency_overrides[get_vector_store] = lambda: vector_store
+        try:
+            yield app
+        finally:
+            app.dependency_overrides.clear()
 
 
 @pytest.fixture

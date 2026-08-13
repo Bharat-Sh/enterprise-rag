@@ -14,6 +14,7 @@ from tests.integration.conftest import (
     api_settings,
     bearer,
     blob_store,
+    collection,
     db_engine,
     hasher,
     login,
@@ -26,6 +27,7 @@ from tests.integration.conftest import (
     tenant,
     uow,
     user,
+    vector_store,
     worker,
 )
 
@@ -35,6 +37,7 @@ __all__ = [
     "api_settings",
     "bearer",
     "blob_store",
+    "collection",
     "db_engine",
     "hasher",
     "login",
@@ -47,5 +50,6 @@ __all__ = [
     "tenant",
     "uow",
     "user",
+    "vector_store",
     "worker",
 ]

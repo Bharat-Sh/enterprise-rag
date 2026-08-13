@@ -53,7 +53,7 @@ How integration dependencies are provided, given no Docker on the dev machine
 | Service | Locally | In CI |
 | --- | --- | --- |
 | Postgres | native Windows install | GitHub Actions service container |
-| Qdrant (M5) | `qdrant-client` local mode (embedded, no server) | service container |
+| Qdrant | `qdrant-client` local mode (embedded, no server) | `qdrant/qdrant:v1.12.4` service container |
 | Redis (M9) | `fakeredis` | service container |
 | Model service (M4) | native Python + CUDA on the host GPU | **stub backend**, started by the workflow |
 
@@ -116,10 +116,21 @@ uv run python scripts/fetch_models.py --tokenizer-only   # ~17 MB, all the worke
 uv run rag-model-service                         # the GPU service, port 8001
 ```
 
-The full suite takes two to four minutes depending on the machine, almost all of
-it Argon2 in the integration and security fixtures. `uv run pytest tests/unit` is
-seconds. M4's tests add about ten seconds in total — if the suite suddenly costs
-minutes more, the model service is not the reason to look at first.
+The full suite takes **six to eight minutes** — measured at 451 s for 792 tests.
+`uv run pytest tests/unit` is still seconds.
+
+Where the time goes, since this grew twice and both times the obvious suspect
+was wrong:
+
+- Most of it is **Argon2** in the integration and security fixtures, as it has
+  been since M2.
+- M4's model-service tests add about **ten seconds** in total.
+- M5 added roughly **three minutes**, and it is real work rather than fixture
+  overhead: every integration test that ingests a document now embeds and
+  indexes it, and the search tests run 2–3 s each end to end. A module that
+  never searches is unchanged at ~0.5 s per test, which was checked rather than
+  assumed — so the vector-store fixture is not the thing to optimise if this
+  ever needs to come down.
 
 **Do not run two pytest invocations at once.** Every integration test truncates
 `rag_test` in its `db_engine` fixture, so concurrent runs delete each other's
@@ -127,18 +138,20 @@ fixtures and fail in ways that look like real bugs.
 
 ## Current state
 
-**M0 through M4 complete.** Config, logging, request context, errors,
+**M0 through M5 complete.** Config, logging, request context, errors,
 liveness/readiness, Docker, CI (M0); schema, migrations, RLS, repositories,
 unit of work, job queue (M1); password and API-key auth, Ed25519 JWTs with JWKS,
 rotating refresh tokens, RBAC, per-tenant rate limiting, `rag-admin` (M2);
 upload, blob store, ingestion worker, chunking, document/collection endpoints,
 `rag-worker` (M3a); PDF and DOCX parsers with hostile-input hardening (M3b);
 the GPU model service, `EmbeddingProvider` and `Reranker` ports, the HTTP
-client, and the real BGE-M3 tokenizer (M4).
+client, and the real BGE-M3 tokenizer (M4); Qdrant behind a `VectorStore` port,
+the ACL pre-filter, `EMBEDDING`/`INDEXING` pipeline stages, and `POST
+/api/v1/search` (M5).
 
 Gate is green: ruff, `ruff format`, mypy strict, **5/5 import contracts**,
-**725 tests** (unit + integration + security, against a real Postgres and a
-stub-backed model service). One skip, allowlisted in
+**792 tests** (unit + integration + security, against a real Postgres, a
+stub-backed model service, and a real vector store). One skip, allowlisted in
 `scripts/assert_suites_ran.py`: the assertion that needs a real GPU backend.
 
 **Check CI, not just the local gate.** They diverged silently for two
@@ -336,6 +349,65 @@ Check `git remote -v` before assuming anything about the remote. The repo is
   builder stage and copied to `/opt/models` — **not** under `/var/lib/rag`,
   which is a VOLUME and would shadow it at runtime.
 
+### M5 subtleties worth not re-discovering
+
+- **The vector store has no row-level security, and that changes what tests
+  mean.** Everywhere else a query that forgets its tenant scope finds zero rows.
+  A Qdrant query that forgets its tenant clause returns *every* tenant's
+  vectors, with a 200. `adapters/vectorstore/filters.py` is the only place a
+  filter is built, it always emits both clauses, and `must` is conjunction —
+  moving either clause to `should` would make a match on the other sufficient.
+- **An HTTP-level isolation test cannot prove the vector filter works.** This
+  was verified: delete the tenant clause and every test in
+  `tests/security/test_search_isolation.py` still passes, because hydration
+  reads under RLS and Postgres drops the foreign rows anyway. The property is
+  provable only at the store, in `tests/security/test_vector_isolation.py`,
+  which does fail. If you are ever tempted to conclude "the end-to-end tests
+  cover it", they do not.
+- **`role:` principal tokens collide across tenants by construction.**
+  `role:owner` is the same literal string in every tenant, unlike user and group
+  ids, which are UUIDs. So a document shared with all owners carries a principal
+  another tenant's owners genuinely hold — the one ACL shape where the tenant
+  clause is the only separation.
+- **An ACL change rewrites the vector payload, and re-embeds nothing.** An ACL
+  change does not change a vector, only who may match it, so
+  `VectorStore.set_acl` uses a payload update. Omitting it fails
+  *one-directionally*, which is why it is easy to miss: revocation still works
+  (hydration re-checks Postgres) while **granting silently does not** — the
+  pre-filter never surfaces the chunk, so a newly-shared document stays
+  invisible with nothing logged.
+- **`set_payload`, never `overwrite_payload`.** The latter replaces the entire
+  payload and would drop `tenant_id`, deleting the field isolation matches on.
+- **An admin who removes their own principal from a document locks everyone
+  out.** `set_acl` reads the document through the caller's access filter first,
+  so after `principals: ["group:finance"]` even the author gets a 404 and can
+  never grant it back. Legal, deliberate, and a genuine foot-gun.
+- **Local-mode Qdrant does not do payload indexes.** The client says so:
+  "Payload indexes have no effect in the local Qdrant." Filters are correct and
+  unindexed, so local runs prove behaviour and say nothing about performance.
+  What local mode *does* support, verified before designing around it: named
+  dense and sparse vectors, filtered search, delete-by-filter, sparse queries,
+  and server-side RRF fusion (which M6 needs).
+- **A path-backed local client holds an exclusive lock on its directory.** Only
+  one per path per process, which is why `Worker` accepts an injected
+  `VectorStore` and why the integration fixtures share exactly one. `:memory:`
+  takes no lock but gives each client its own empty storage — it is a different
+  constructor argument, not a magic path, because `path=":memory:"` would try to
+  create a directory with a name Windows does not allow.
+- **Sparse vectors are written from M5 and queried from M6.** A collection's
+  vector configuration is fixed at creation, and BGE-M3 produces both in one
+  pass. Storing dense only would have made M6 a full re-embed of the corpus to
+  save nothing.
+- **Point id *is* chunk id.** That is what makes re-indexing an overwrite, the
+  write path safe to retry, and redelivery unable to inflate the index.
+- **An empty sparse vector is omitted, not sent.** Qdrant rejects a sparse
+  vector with no entries, and a chunk of pure punctuation legitimately produces
+  one. It stays retrievable by its dense vector.
+- **`check_compatibility=False` on the client is deliberate.** Its version check
+  warns on any minor-version gap including combinations that work; a warning
+  nobody can act on is one everybody learns to ignore. Compatibility is
+  established instead by CI running the suite against the pinned server image.
+
 ## Known limitations
 
 Everything here is a **deliberate, known gap**, not a bug and not an oversight.
@@ -445,25 +517,61 @@ garbage. Orphans are the cheaper mistake.
 `documents.blob_key`. Belongs in M12 with the ACL reconciliation job it
 resembles.
 
-### `CHUNKING → READY` must be removed in M5
+### No reindex tooling, and no drift detection
 
-**What happens.** `rag.domain.state.ALLOWED_TRANSITIONS` currently permits a
-document to go straight from `CHUNKING` to `READY`, because the M3 pipeline
-stops at chunks — there is no embedding provider until M4 and no vector index
-until M5.
+**What happens.** `REINDEXING` is a state in the machine that nothing drives.
+There is no command to rebuild the index from Postgres, and nothing detects
+drift between the *four* places an ACL now lives: the `document_permissions`
+rows, the array on `documents`, the copy on every chunk, and the Qdrant payload.
 
-**Why this is dangerous to leave.** Once indexing exists, a document that
-reaches `READY` without vectors is **invisible to retrieval while claiming to be
-searchable**, and nothing errors. That is the worst failure shape in the system.
+**Why it is like this.** The architectural promise of ADR-0001 is intact —
+chunk text plus the model service is everything a rebuild needs — and the write
+paths keep the four in step within a request. What is missing is the repair tool
+for when they nonetheless diverge: a partial write, a restored snapshot, a crash
+between the commit and the payload update.
 
-**What to do in M5.** Delete `S.READY` from the `S.CHUNKING` frozenset in
-`ALLOWED_TRANSITIONS`, then delete `TestTemporaryEdgeForM3` from
-`tests/unit/test_state.py`. That test class asserts the edge is *present*, so
-removing the edge fails it on purpose — it exists so this cannot be forgotten,
-and its failure message says as much.
+**What contains it.** Drift fails safe in the direction that matters. A stale
+*permissive* index cannot disclose, because hydration re-checks Postgres under
+row-level security and drops the row — asserted by
+`test_a_stale_index_still_cannot_disclose`. A stale *restrictive* index costs
+recall: a document stays invisible to someone it was shared with.
 
-**Where to look.** `rag/domain/state.py::ALLOWED_TRANSITIONS`,
-`tests/unit/test_state.py::TestTemporaryEdgeForM3`.
+**The real fix.** M12, alongside the ACL reconciliation job ADR-0006 already
+scheduled. A `rag-admin reindex` would also make `REINDEXING` mean something.
+
+### Search fetches document titles one query at a time
+
+**What happens.** `RetrievalService._document_titles` calls
+`documents.get(id, access)` once per distinct document in a result set. With
+`top_k=100` spread across 100 documents that is 100 round trips on the hottest
+read path in the system.
+
+**Why it is like this.** The read has to be ACL-aware, and
+`DocumentRepository` has no batch method that takes an `AccessFilter`. Adding
+one is straightforward; it was left out of M5 to keep the repository surface
+from growing alongside everything else the milestone introduced.
+
+**What contains it.** Each call is a primary-key lookup under row-level
+security, the loop is bounded by `top_k` (max 100), and real result sets cluster
+into a handful of documents rather than spreading evenly. So it is a few
+milliseconds in practice and a bad shape in principle.
+
+**The real fix.** `DocumentRepository.get_many(ids, access)`, mirroring
+`ChunkRepository.get_many`, and one call instead of the loop.
+
+### Search is dense-only
+
+**What happens.** `/search` queries the dense vector. The sparse vectors BGE-M3
+produces are written to the index on every ingest and never read.
+
+**Why it is like this.** A Qdrant collection's vector configuration is fixed at
+creation, so writing sparse now is what makes M6 a query change rather than a
+full re-embed of the corpus. Querying it — fusion, weighting, whether hybrid
+helps at all — is an evaluation question that needs M10's golden set to answer.
+Shipping untuned fusion would add a knob nobody could justify turning.
+
+**The real fix.** M6, using the Query API's server-side RRF, which was verified
+to work in local mode as part of M5's groundwork.
 
 ### Token counts are estimates *unless configured otherwise*
 
@@ -564,20 +672,26 @@ is a hard physical limit rather than a preference.
   so a member cannot delete their own upload. Deliberate: adding ownership means
   an owner check on every path, and it is one predicate to add later.
 
-## Next: M5 — the vector index
+## Next: M6 — hybrid retrieval
 
-Qdrant behind a `VectorStore` port, hybrid dense + sparse search with the ACL
-pre-filter pushed into the query (non-negotiable #4), and the ingestion pipeline
-finally gaining its `EMBEDDING` and `INDEXING` stages using the M4 ports that
-are already built and tested.
+The sparse vectors are already in the index, written on every ingest since M5
+and never read. M6 turns them on: a second `Prefetch` in the Qdrant Query API
+plus server-side `FusionQuery(RRF)`, which needs no re-indexing and was verified
+to work in local mode during M5's groundwork.
 
-**M5 must delete the `CHUNKING → READY` edge** from
-`rag.domain.state.ALLOWED_TRANSITIONS`, then delete `TestTemporaryEdgeForM3`
-from `tests/unit/test_state.py`. That test asserts the edge is *present*, so
-removing it fails on purpose — it exists so this cannot be forgotten. Also flip
-the `model-service` readiness check to `required=True` once an endpoint exists
-that cannot answer without it, and update
-`test_a_down_model_service_does_not_block_readiness`.
+The real work is not the query, it is knowing whether it helps. Fusion has
+weights, and tuning them without a golden set is guesswork that becomes a knob
+nobody dares turn. Consider pulling part of M10's eval harness forward, or
+shipping fusion behind a setting that defaults off until there is a measurement.
+
+Also outstanding, in rough priority order:
+
+- **Flip `model-service` and `qdrant` to `required=True`** if and when search
+  becomes the dominant traffic — but read the reasoning in `rag/api/main.py`
+  first, which argues against it and has already reversed once.
+- **`rag-admin reindex`**, which would give `REINDEXING` something that drives
+  it and make ADR-0001's rebuild promise operational rather than theoretical.
+- **The ACL reconciliation job** (M12), now that an ACL lives in four places.
 
 Add new permissions to `rag.domain.authz.MINIMUM_ROLE` rather than checking
 roles inline — the table is what makes "which endpoints can a viewer reach?"

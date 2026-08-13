@@ -45,6 +45,22 @@ jobs:
           --health-timeout 3s
           --health-retries 10
 
+      # A real Qdrant, not the client's embedded local mode. Local mode is what
+      # the primary development machine uses (no Docker there — CLAUDE.md) and
+      # it is honest about its limits: the client warns that **payload indexes
+      # have no effect** in it, so every filter is a full scan. The isolation
+      # tests are correct either way, but only here do they run against the
+      # engine that production runs, with `is_tenant` co-location and the ACL
+      # index actually in place.
+      #
+      # No healthcheck option: the image ships no shell, curl or wget, so there
+      # is nothing to exec. The test fixtures probe the port themselves.
+      qdrant:
+        image: qdrant/qdrant:v1.12.4
+        ports:
+          - 6333:6333
+          - 6334:6334
+
     steps:
       - uses: actions/checkout@v4
 
@@ -197,6 +213,8 @@ jobs:
           RAG_TEST_DB_PASSWORD: rag
           RAG_TEST_DB_NAME: rag_test
           RAG_TEST_MODEL_SERVICE_URL: http://127.0.0.1:8001
+          RAG_TEST_QDRANT_HOST: 127.0.0.1
+          RAG_TEST_QDRANT_PORT: "6333"
         run: |
           uv run pytest --cov=rag --cov-report=term-missing --cov-report=xml \
             --junitxml=junit.xml

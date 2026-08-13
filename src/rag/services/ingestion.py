@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from rag.core.config import IngestionSettings
     from rag.domain.access import AuthenticatedPrincipal
     from rag.domain.models import Document
-    from rag.domain.ports import BlobStore, UnitOfWork
+    from rag.domain.ports import BlobStore, UnitOfWork, VectorStore
 
 __all__ = ["IngestionService", "UploadSource"]
 
@@ -78,10 +78,12 @@ class IngestionService:
         blobs: BlobStore,
         settings: IngestionSettings,
         supported_types: Collection[ContentType],
+        vectors: VectorStore,
     ) -> None:
         self._uow = uow
         self._blobs = blobs
         self._settings = settings
+        self._vectors = vectors
         # Injected rather than derived from an enum property. What this build
         # can parse is a fact about the *adapters* wired into it, and a service
         # may not import them — so a milestone-named `is_supported` on the enum
@@ -185,6 +187,20 @@ class IngestionService:
         tokens = self._validated_tokens(principal, principals)
         await self._uow.documents.set_acl(document_id, tokens)
         await self._uow.commit()
+
+        # The fourth representation. `documents.set_acl` rewrites the grants,
+        # the document's array and the copy on every chunk (docs/adr/0006); the
+        # vector payload is the one the pre-filter actually reads, and leaving
+        # it stale would mean a newly-shared document stays invisible to the
+        # people it was just shared with.
+        #
+        # After the commit, deliberately. Postgres is the source of truth and
+        # the index is derived (ADR-0001), so the derived store must never be
+        # ahead of it. A crash between the two leaves the index carrying the old
+        # ACL — which fails safe in the revocation direction, because hydration
+        # re-checks Postgres, and is what the reconciliation job in M12 exists
+        # to repair in the other.
+        await self._vectors.set_acl(principal.tenant_id, document_id, tokens)
 
         _log.info("ingestion.acl_changed", document_id=str(document_id), principals=len(tokens))
         updated = await self._uow.documents.get(document_id, principal.access)
