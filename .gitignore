@@ -21,9 +21,16 @@ venv/
 coverage.xml
 htmlcov/
 
-# Local data / models
-data/
-models/
+# Local data / downloaded model weights.
+#
+# **Anchored with a leading slash, and that is load-bearing.** An unanchored
+# `models/` matches at *any* depth, so it silently swallowed the entire
+# `src/rag/adapters/models/` package — the HTTP client for the model service
+# would have been absent from the repository while working perfectly on the
+# machine that wrote it. Anything named `models/` is a plausible package name;
+# only the repo-root one is downloaded weights.
+/data/
+/models/
 *.log
 
 # Editors / OS
@@ -36,3 +43,6 @@ junit.xml
 
 # Default blob-store root for local development (RAG_INGESTION__BLOB_ROOT).
 var/
+
+# Transient PID file written by the CI step that starts the model service.
+model-service.pid

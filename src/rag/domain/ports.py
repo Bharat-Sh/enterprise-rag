@@ -16,8 +16,8 @@ the caller to invent a `created_at` before the row exists, and that invented
 value then disagrees with `now()` on the server by the network round trip.
 Passing fields keeps one authority for every column.
 
-Ports added in later milestones — `VectorStore`, `EmbeddingProvider`,
-`Reranker`, `LLMClient`, `Cache` — belong in this module too.
+Ports added in later milestones — `VectorStore`, `LLMClient`, `Cache` — belong
+in this module too.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
     from rag.domain.access import AccessFilter
     from rag.domain.credentials import AccessToken, TokenClaims
+    from rag.domain.embedding import Embedding, EmbedMode, ModelInfo, RerankResult
     from rag.domain.enums import DocumentStatus, JobKind, JobStatus, Role, UserStatus
     from rag.domain.ingestion import ParsedDocument
     from rag.domain.models import (
@@ -55,11 +56,13 @@ __all__ = [
     "CollectionRepository",
     "DocumentParser",
     "DocumentRepository",
+    "EmbeddingProvider",
     "GroupRepository",
     "JobRepository",
     "PasswordHasher",
     "RateLimiter",
     "RefreshTokenRepository",
+    "Reranker",
     "TenantRepository",
     "TokenCounter",
     "TokenIssuer",
@@ -543,14 +546,76 @@ class DocumentParser(Protocol):
 class TokenCounter(Protocol):
     """Counts tokens the way the embedding model will.
 
-    M3 ships a character-ratio estimator; M4 replaces it with the real BGE-M3
-    tokenizer once the model service exists. A port rather than a direct import
-    because chunk sizing is the one place where being wrong is invisible —
-    chunks silently over the model's window get truncated at embedding time,
-    losing their tail with no error anywhere.
+    M3 ships a character-ratio estimator; M4 adds `BgeTokenCounter`, which loads
+    BGE-M3's real vocabulary. A port rather than a direct import because chunk
+    sizing is the one place where being wrong is invisible — chunks silently
+    over the model's window get truncated at embedding time, losing their tail
+    with no error anywhere.
+
+    **Synchronous, and that is a constraint on implementations, not an
+    oversight.** The recursive splitter calls this once per candidate span,
+    which is hundreds of calls per document. An implementation that reached the
+    model service over HTTP would therefore make chunking hundreds of round
+    trips, and would have to be `async`, which would push the thread hop into
+    `rag.domain.chunking`. The tokenizer runs in-process; only inference is
+    remote.
     """
 
     def count(self, text: str) -> int: ...
+
+
+@runtime_checkable
+class EmbeddingProvider(Protocol):
+    """Turns text into vectors (docs/adr/0004).
+
+    Async because the implementation is a network call to the GPU model service.
+    Batched because the GPU is: one forward pass over 32 texts costs barely more
+    than one over a single text, so a per-text interface would leave most of the
+    hardware idle and multiply the round trips.
+    """
+
+    async def embed(self, texts: Sequence[str], *, mode: EmbedMode) -> Sequence[Embedding]:
+        """Embed every text, returning results in the order given.
+
+        Order is part of the contract: the caller pairs results back to chunk
+        ids positionally, so a provider that reorders — for length bucketing,
+        say — must restore the original order before returning. Getting this
+        wrong attaches every vector to the wrong chunk, and retrieval still
+        *works*, it just returns nonsense.
+
+        Raises `DependencyUnavailableError` when the service cannot be reached
+        or fails. Deliberately **not** fail-open, unlike `RateLimiter`: there is
+        no degraded embedding, and a document indexed with placeholder vectors
+        is unfindable while claiming to be searchable.
+        """
+        ...
+
+    async def info(self) -> ModelInfo:
+        """Identify the models in use, for stamping onto chunk rows."""
+        ...
+
+
+@runtime_checkable
+class Reranker(Protocol):
+    """Re-scores retrieved passages against a query with a cross-encoder.
+
+    Separate from `EmbeddingProvider` even though one adapter satisfies both.
+    They are used at different points by different code, and a deployment that
+    embeds locally while reranking through a hosted API — or skips reranking
+    entirely — is a real shape. One combined port would make that a fork rather
+    than a wiring change.
+    """
+
+    async def rerank(
+        self, query: str, passages: Sequence[str], *, top_k: int | None = None
+    ) -> Sequence[RerankResult]:
+        """Score passages, returned highest-first.
+
+        Results reference passages by their index in `passages`. `top_k` trims
+        the response; scoring cost is unaffected, because a cross-encoder must
+        run over every candidate to know which ones win.
+        """
+        ...
 
 
 @runtime_checkable

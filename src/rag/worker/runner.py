@@ -32,7 +32,7 @@ import anyio
 
 from rag.adapters.blobs.filesystem import FilesystemBlobStore
 from rag.adapters.parsers import build_registry
-from rag.adapters.tokenize import HeuristicTokenCounter
+from rag.adapters.tokenize import build_token_counter
 from rag.core.logging import get_logger
 from rag.db.repositories.job import backoff_delay
 from rag.db.uow import SqlAlchemyUnitOfWork
@@ -64,7 +64,11 @@ class Worker:
         self._name = settings.worker.name or f"{socket.gethostname()}-{id(self):x}"
         self._blobs = FilesystemBlobStore(settings.ingestion.blob_root)
         self._parsers = build_registry(settings.ingestion)
-        self._tokens = HeuristicTokenCounter()
+        # Built here, at construction, so a `bge-m3` tokenizer whose vocabulary
+        # file is missing kills the worker at startup. Deferring it to first use
+        # would mean the worker starts, claims a job, and fails it — repeatedly,
+        # across every document in the queue, for a configuration problem.
+        self._tokens = build_token_counter(settings.ingestion)
         self._stopping = anyio.Event()
         self._last_reap = datetime.now(UTC) - timedelta(days=1)
 
@@ -82,7 +86,17 @@ class Worker:
         self._stopping.set()
 
     async def run_forever(self) -> None:
-        _log.info("worker.started", worker=self._name, blob_root=self._settings.ingestion.blob_root)
+        # The tokenizer is logged because it is invisible otherwise and it
+        # changes the output: chunks sized by the estimator and chunks sized by
+        # BGE-M3's vocabulary have different boundaries, so a corpus ingested
+        # across a config change is not internally consistent. This line is what
+        # makes that answerable after the fact.
+        _log.info(
+            "worker.started",
+            worker=self._name,
+            blob_root=self._settings.ingestion.blob_root,
+            tokenizer=str(self._settings.ingestion.tokenizer),
+        )
         while not self._stopping.is_set():
             await self._reap_if_due()
             processed = await self.run_once()

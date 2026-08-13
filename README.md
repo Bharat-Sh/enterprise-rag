@@ -4,10 +4,12 @@ A multi-tenant, production-shaped retrieval-augmented generation platform:
 documents in, grounded and cited answers out, with access control, evaluation,
 and observability treated as features rather than afterthoughts.
 
-> **Status: M3 — Ingestion complete.** PDF, DOCX, HTML, Markdown and plain text
-> can be uploaded, stored, parsed, and chunked by a background worker, behind an
-> API where every endpoint authenticates and every query is tenant-scoped.
-> Retrieval arrives in M5. Milestones below.
+> **Status: M4 — Ingestion and the model service.** PDF, DOCX, HTML, Markdown
+> and plain text can be uploaded, stored, parsed, and chunked by a background
+> worker, behind an API where every endpoint authenticates and every query is
+> tenant-scoped. A separate GPU service serves BGE-M3 embeddings and
+> cross-encoder reranking over HTTP, so the API and worker stay CPU-only.
+> Retrieval — the part that connects the two — arrives in M5. Milestones below.
 
 ---
 
@@ -149,8 +151,15 @@ Chunking is recursive splitting on a separator hierarchy — paragraphs, then
 lines, then sentences, then words — packed to a token target with overlap, so
 boundaries land on the most meaningful break available. Offsets are tracked as
 spans into the original text and are exact, which is what a citation feature
-will need. Token counts are an honest estimate until M4 brings the real
-tokenizer; `tiktoken` was rejected as a precise measurement of the wrong model.
+will need.
+
+Chunks are sized either by a character-ratio estimate or by BGE-M3's real
+vocabulary, selected with `RAG_INGESTION__TOKENIZER`. The estimate is the
+default so a fresh clone needs no download; production should use the real one.
+It is never an automatic fallback — the two produce different boundaries, and
+picking one based on whether a file happened to exist would mean the same
+document chunks differently on two machines with nothing logged.
+`tiktoken` was rejected outright as a precise measurement of the wrong model.
 
 Run it:
 
@@ -158,6 +167,49 @@ Run it:
 uv run rag-worker           # poll forever
 uv run rag-worker --once    # drain one batch and exit
 ```
+
+---
+
+## The model service
+
+Embeddings and reranking run in a **separate process on the GPU**, reached over
+HTTP ([ADR-0004](docs/adr/0004-local-model-service.md),
+[ADR-0011](docs/adr/0011-model-service-implementation.md)). The API and the
+ingestion worker never import torch and never need a GPU node.
+
+```
+POST /v1/embed    {texts[], mode}          -> dense[] + sparse{indices,values}
+POST /v1/rerank   {query, passages[], k}   -> [{index, score}] highest first
+GET  /v1/info                              -> model, version, dims, tokenizer hash
+```
+
+| Decision | Why |
+|---|---|
+| **A separate process, not in-process inference** | Model weights want exactly one process per GPU; HTTP handling wants many. Four uvicorn workers would load four copies of the weights into VRAM. |
+| **One GPU lock, batched by token budget** | Two concurrent forward passes on a 6 GB card is an out-of-memory error, and a CUDA OOM can poison the context for the life of the process. Activation memory scales with *tokens*, not items, so batches are formed against a token budget rather than a fixed count. |
+| **Over-length input is rejected, not truncated** | A truncated chunk produces a vector that is structurally perfect and missing the end of the text. No error, undetectable from outside, permanent once indexed. |
+| **Vectors are normalised by the service** | So cosine similarity is a dot product and no caller can forget. A caller that forgot would get scores that are wrong and plausible. |
+| **Order is contractual, and verified** | Results pair back to chunk ids positionally. The client refuses a response whose length does not match its request — otherwise every vector after a gap attaches to the wrong chunk, and retrieval keeps working while returning unrelated text. |
+| **The client fails closed** | Unlike the rate limiter. There is no degraded embedding: a document indexed with placeholder vectors is unfindable while claiming to be searchable. |
+| **It never logs the text it is given** | The service is tenant-blind, so it cannot make an access decision about a log line. Counts and token totals only. There is a security test, and it was verified to fail when one debug field was added. |
+
+`mode: query|passage` is carried even though BGE-M3 ignores it — E5 and Voyage
+need it, and retrofitting it later would mean re-embedding everything.
+
+Run it:
+
+```bash
+uv sync --extra gpu
+uv run python scripts/fetch_models.py     # ~2.3 GB of weights + vocabulary
+uv run rag-model-service                  # port 8001
+```
+
+**Without a GPU**, `MODEL_SERVICE_BACKEND=stub` serves the identical contract
+with deterministic fake vectors and no torch. It is not a mock — it is a real
+implementation of the same interface, which is how the routes, limits, batching
+and error paths are tested in CI. It reports `embedding_model: "stub"`, and that
+string is stamped into every chunk row it produces, so a corpus embedded by
+accident says so in the database.
 
 ---
 
@@ -279,6 +331,12 @@ Or run the whole stack in containers: `docker compose -f docker/compose.yml up -
 | Architecture contracts | `uv run lint-imports` |
 | Tests | `uv run pytest --cov=rag --cov-report=term-missing` |
 | Everything CI runs | all five of the above |
+| Model service (no GPU) | `MODEL_SERVICE_BACKEND=stub uv run rag-model-service` |
+| Model service (GPU) | `uv sync --extra gpu && uv run rag-model-service` |
+| Fetch the tokenizer only | `uv run python scripts/fetch_models.py --tokenizer-only` |
+
+The model-service integration tests skip when nothing is listening on port 8001.
+Start the stub first to run them; CI does exactly that.
 
 ---
 
@@ -342,7 +400,7 @@ caching but not correctness).
 | M2 | Auth & RBAC — JWT, API keys, roles, tenant scoping, rate limiting | **done** |
 | M3a | Ingestion — upload, blob store, worker, chunking, state machine | **done** |
 | M3b | Parsers — PDF, DOCX, and hostile-input hardening | **done** |
-| M4 | Model service — BGE-M3 + reranker on GPU, batching | |
+| M4 | Model service — BGE-M3 + reranker on GPU, batching | **done** |
 | M5 | Dense retrieval — Qdrant, ACL pre-filter, `/search` | |
 | M6 | Hybrid retrieval — sparse vectors, reciprocal rank fusion | |
 | M7 | Reranking — cross-encoder, circuit breaker | |

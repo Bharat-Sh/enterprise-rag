@@ -1,6 +1,6 @@
 # ADR-0004 — Local BGE-M3 behind a separate GPU model service
 
-- **Status:** Accepted
+- **Status:** Accepted; batching decision amended by ADR-0011
 - **Date:** 2026-07-30
 - **Milestone:** M0 (design), M4 (implementation)
 
@@ -64,6 +64,19 @@ migration survivable (re-embed into a new named vector, backfill, cut over).
 substitutability. Concurrency is handled by dynamic micro-batching inside the
 service — requests queue, a single consumer batches them into one forward pass.
 The service therefore runs with exactly one uvicorn worker.
+
+> **Amended in M4 (ADR-0011).** The micro-batcher is **deferred, not
+> cancelled**. What shipped is a single GPU lock plus sub-batching *within* a
+> request against a token budget. A caller already sends many texts per request,
+> so the remaining win is confined to many small *concurrent* requests — that is
+> query-time embedding, which does not exist before M6, and building it now
+> would mean tuning `max_wait_ms` against a load shape nobody has measured. The
+> "exactly one uvicorn worker" part is unchanged and is not configurable:
+> weights are per process, so a second worker is a second copy in VRAM.
+>
+> M4 also found the number this ADR was written without: the development GPU has
+> **6 GB**, which is why `max_sequence_tokens` defaults to 1024 rather than
+> BGE-M3's 8192. See ADR-0011 §3.
 
 **We pay:** one more service; a network hop (~2–5 ms, negligible against ~60 ms
 of GPU rerank); and a cold start of 20–60 s while both models load, which is why

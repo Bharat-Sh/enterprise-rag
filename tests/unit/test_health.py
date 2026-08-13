@@ -188,6 +188,41 @@ class TestReadinessEndpoint:
         # accidentally-deleted `register` call would go unnoticed.
         assert "postgres" in app.state.health.names
 
+    async def test_the_application_wires_the_model_service_check(self, client, app) -> None:
+        assert "model-service" in app.state.health.names
+
+    async def test_a_down_model_service_does_not_block_readiness(self, client, app) -> None:
+        # M4 has no endpoint that needs a GPU — retrieval arrives in M6 — and
+        # everything the API currently serves works while the model service is
+        # down. Marking it required would pull every API replica out of the load
+        # balancer whenever the GPU box restarts, converting a degraded feature
+        # into a total outage.
+        #
+        # **M6 must flip this to required** and change this test, at the point
+        # where there is an endpoint that cannot answer without it.
+        #
+        # Asserted over the component in isolation rather than over the whole
+        # `/ready` response, because the registry also holds the Postgres check
+        # and a unit test must not depend on a database being up.
+        #
+        # And asserted on `required` only, never on `healthy`. An earlier version
+        # checked that the component was *unhealthy* — reasoning that nothing
+        # listens on port 8001 during a unit run — and that was wrong: CI starts
+        # a stub model service for the integration suite, in the same process
+        # tree, so the check succeeds there and the test failed. Whether a
+        # dependency happens to be up is not something a unit test may assume in
+        # either direction.
+        components = await app.state.health.run_all()
+        model_service = next(item for item in components if item.name == "model-service")
+
+        assert model_service.required is False
+        # The consequence that actually matters, stated without a network: an
+        # unhealthy optional component does not make the process unready.
+        unhealthy = ComponentHealth(
+            name="model-service", healthy=False, required=False, duration_ms=1.0
+        )
+        assert is_ready([unhealthy]) is True
+
 
 class TestRequestContextHeaders:
     async def test_ids_are_returned_on_every_response(self, client) -> None:

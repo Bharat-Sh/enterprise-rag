@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.7
 #
 # Multi-stage build for the API and the ingestion worker — same image, different
-# CMD (`rag-worker`). The model service gets its own CUDA-based Dockerfile in
-# M4; this image stays CPU-only and small.
+# CMD (`rag-worker`). The model service has its own CUDA-based Dockerfile
+# (Dockerfile.model); this image stays CPU-only and small, which is the entire
+# payoff of putting an HTTP boundary between them (docs/adr/0004).
 
 # --------------------------------------------------------------------------
 # Stage 1 — builder: resolve dependencies into a self-contained virtualenv.
@@ -25,10 +26,24 @@ RUN uv venv "$VIRTUAL_ENV"
 # Dependency layer. We copy only the manifest and stub out the package so this
 # layer's cache key depends on pyproject.toml alone — editing application code
 # then rebuilds in seconds instead of re-resolving the dependency tree.
+# Both packages are stubbed, because hatch is configured to build both and a
+# missing directory fails the build before a single dependency is resolved.
+# `model_service` is a few hundred kilobytes of pure Python here; what this
+# image does *not* get is the `gpu` extra, and therefore not torch.
 COPY pyproject.toml README.md ./
-RUN mkdir -p src/rag && touch src/rag/__init__.py
+RUN mkdir -p src/rag src/model_service \
+    && touch src/rag/__init__.py src/model_service/__init__.py
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install .
+
+# BGE-M3's vocabulary, so the worker can size chunks exactly rather than with
+# the estimator. 17 MB, and fetched in the *builder* — huggingface-hub is a
+# build-time tool here and has no business in the runtime image. Only the one
+# JSON file is copied forward.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install huggingface-hub
+COPY scripts/fetch_models.py ./scripts/fetch_models.py
+RUN python scripts/fetch_models.py --tokenizer-only --root /opt/models
 
 # Source layer. --no-deps because the dependency set is already installed above.
 # TODO(M13): commit a uv.lock and switch to `uv sync --frozen` for byte-for-byte
@@ -52,6 +67,14 @@ RUN groupadd --system --gid 1001 rag \
     && useradd --system --uid 1001 --gid rag --create-home --shell /usr/sbin/nologin rag
 
 COPY --from=builder --chown=rag:rag /opt/venv /opt/venv
+
+# The tokenizer, and the configuration that makes the worker use it. Under
+# /opt rather than /var/lib/rag because the latter is a VOLUME, and a volume
+# mount shadows whatever the image baked into that path at runtime — the file
+# would be present at build time and gone the moment the container starts.
+COPY --from=builder --chown=rag:rag /opt/models /opt/models
+ENV RAG_INGESTION__TOKENIZER=bge-m3 \
+    RAG_INGESTION__TOKENIZER_PATH=/opt/models/bge-m3/tokenizer.json
 
 # Blob storage root (docs/adr/0009). Created here, owned by the app user,
 # because the container runs unprivileged and cannot create a directory under
