@@ -31,8 +31,10 @@ from typing import TYPE_CHECKING
 import anyio
 
 from rag.adapters.blobs.filesystem import FilesystemBlobStore
+from rag.adapters.models import HttpModelClient
 from rag.adapters.parsers import build_registry
 from rag.adapters.tokenize import build_token_counter
+from rag.adapters.vectorstore import QdrantVectorStore
 from rag.core.logging import get_logger
 from rag.db.repositories.job import backoff_delay
 from rag.db.uow import SqlAlchemyUnitOfWork
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
 
     from rag.core.config import Settings
     from rag.domain.models import Job
+    from rag.domain.ports import EmbeddingProvider, VectorStore
 
 __all__ = ["Worker"]
 
@@ -58,7 +61,19 @@ class Worker:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         settings: Settings,
+        *,
+        embeddings: EmbeddingProvider | None = None,
+        vectors: VectorStore | None = None,
     ) -> None:
+        """Build a worker. It constructs its own dependencies unless given them.
+
+        The two optional arguments exist because a path-backed local-mode Qdrant
+        holds an **exclusive lock on its storage directory**, so only one client
+        per path can exist in a process. An end-to-end test that drives the
+        worker and the API together therefore has to hand both of them the same
+        store rather than let each build its own — and reaching into a private
+        attribute to do that would be worse than a named seam.
+        """
         self._session_factory = session_factory
         self._settings = settings
         self._name = settings.worker.name or f"{socket.gethostname()}-{id(self):x}"
@@ -69,8 +84,45 @@ class Worker:
         # would mean the worker starts, claims a job, and fails it — repeatedly,
         # across every document in the queue, for a configuration problem.
         self._tokens = build_token_counter(settings.ingestion)
+        # The worker embeds and indexes, so it holds both. Constructed once:
+        # `HttpModelClient` owns a connection pool whose keep-alive is most of
+        # the point, and a per-job client would hand it back after every
+        # document.
+        #
+        # Ownership is tracked **per dependency**, not as one flag for both. An
+        # earlier version used `embeddings is None and vectors is None`, which
+        # meant that injecting only one of them silently leaked the other: the
+        # worker built an `HttpModelClient`, decided it owned nothing, and never
+        # closed the pool.
+        self._owned_embeddings: HttpModelClient | None = None
+        self._owned_vectors: QdrantVectorStore | None = None
+        if embeddings is None:
+            self._owned_embeddings = HttpModelClient(settings.model_service)
+            embeddings = self._owned_embeddings
+        if vectors is None:
+            self._owned_vectors = QdrantVectorStore(settings.qdrant)
+            vectors = self._owned_vectors
+        self._embeddings: EmbeddingProvider = embeddings
+        self._vectors: VectorStore = vectors
         self._stopping = anyio.Event()
         self._last_reap = datetime.now(UTC) - timedelta(days=1)
+
+    async def aclose(self) -> None:
+        """Release the connection pool and the local-mode storage lock.
+
+        Local-mode Qdrant holds a lock on its storage directory; leaving it open
+        makes the next process to open the same path fail in a way that looks
+        like an unrelated problem somewhere else entirely.
+
+        Closes only what this worker constructed. An injected dependency
+        belongs to whoever injected it, and closing it here would make one
+        test's teardown break the next — the same rule `HttpModelClient.aclose`
+        follows.
+        """
+        if self._owned_embeddings is not None:
+            await self._owned_embeddings.aclose()
+        if self._owned_vectors is not None:
+            await self._owned_vectors.aclose()
 
     @property
     def name(self) -> str:
@@ -146,6 +198,8 @@ class Worker:
                 tokens=self._tokens,
                 parser_for=self._parsers.get,
                 settings=self._settings.ingestion,
+                embeddings=self._embeddings,
+                vectors=self._vectors,
             )
 
             try:

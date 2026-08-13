@@ -16,8 +16,8 @@ the caller to invent a `created_at` before the row exists, and that invented
 value then disagrees with `now()` on the server by the network round trip.
 Passing fields keeps one authority for every column.
 
-Ports added in later milestones — `VectorStore`, `LLMClient`, `Cache` — belong
-in this module too.
+Ports added in later milestones — `LLMClient`, `Cache` — belong in this module
+too.
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ if TYPE_CHECKING:
         User,
     )
     from rag.domain.ratelimit import RateLimitDecision, RateLimitPolicy
+    from rag.domain.retrieval import SearchHit, VectorPoint
 
 __all__ = [
     "ApiKeyRepository",
@@ -69,6 +70,7 @@ __all__ = [
     "TokenVerifier",
     "UnitOfWork",
     "UserRepository",
+    "VectorStore",
 ]
 
 
@@ -615,6 +617,93 @@ class Reranker(Protocol):
         the response; scoring cost is unaffected, because a cross-encoder must
         run over every candidate to know which ones win.
         """
+        ...
+
+
+@runtime_checkable
+class VectorStore(Protocol):
+    """The derived vector index (docs/adr/0001, docs/adr/0006).
+
+    **Every read takes an `AccessFilter`, and there is no method that does not.**
+    That is structural, matching `DocumentRepository`, and here it carries more
+    weight than it does there. Postgres has row-level security: a query that
+    forgets its tenant scope finds zero rows. A vector store has no equivalent —
+    a query that forgets its tenant filter returns *every tenant's* vectors, and
+    nothing anywhere objects. The filter cannot be optional and cannot be
+    supplied by a caller; implementations build it themselves from the
+    `AccessFilter` and must never accept a pre-built one.
+
+    Disposable by contract. Nothing here is a source of truth: every point can
+    be rebuilt from `chunks` plus the embedding provider, which is what makes
+    changing chunking or embedding model survivable rather than terrifying.
+    """
+
+    async def ensure_ready(self) -> None:
+        """Create the collection and its payload indexes if absent.
+
+        Idempotent, and called at startup rather than lazily on first write: a
+        misconfigured vector store should fail where an operator is watching,
+        not on the first document a user uploads.
+        """
+        ...
+
+    async def upsert(self, points: Sequence[VectorPoint]) -> int:
+        """Write points, overwriting any with the same id.
+
+        Idempotent because point ids are chunk ids. A worker that dies
+        mid-indexing is redelivered and rewrites the same points, rather than
+        needing to know which of them already landed.
+        """
+        ...
+
+    async def search(
+        self,
+        embedding: Embedding,
+        access: AccessFilter,
+        *,
+        limit: int,
+        collection_id: UUID | None = None,
+        document_ids: Sequence[UUID] | None = None,
+    ) -> Sequence[SearchHit]:
+        """Nearest neighbours the caller is permitted to see.
+
+        The access check is a **pre-filter**, evaluated inside the query
+        (non-negotiable #4). Post-filtering is wrong twice over: asking for the
+        top 50 and discarding 40 leaves 10 results, not the true top 10 — and
+        the vectors were already read before the check, so the disclosure has
+        already happened.
+        """
+        ...
+
+    async def set_acl(
+        self, tenant_id: UUID, document_id: UUID, acl_principals: Sequence[str]
+    ) -> None:
+        """Rewrite the ACL on every point of one document.
+
+        An ACL change does not change a single vector — only who is allowed to
+        match one — so this updates the payload in place rather than re-embedding
+        anything. That is the difference between a permission change costing a
+        payload write and costing a GPU pass over the whole document.
+
+        It matters that this exists at all. `documents.set_acl` rewrites three
+        representations in Postgres (docs/adr/0006); without a fourth write here
+        the index keeps the old ACL, and a *widened* grant would then silently
+        fail to return the newly-shared document. A *narrowed* one is caught by
+        the re-check at hydration, so the failure is one-directional — but
+        "half of revocation works" is not a property worth relying on.
+        """
+        ...
+
+    async def delete_for_document(self, tenant_id: UUID, document_id: UUID) -> None:
+        """Remove every point belonging to one document.
+
+        By filter rather than by id, so purging does not depend on first
+        reading the chunk rows it is about to delete.
+        """
+        ...
+
+    async def count_for_tenant(self, tenant_id: UUID) -> int:
+        """Points held for one tenant. For operations and reconciliation."""
         ...
 
 

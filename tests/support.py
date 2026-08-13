@@ -185,3 +185,57 @@ def production_overrides(**extra: Any) -> dict[str, Any]:
     }
     overrides.update(extra)
     return overrides
+
+
+class StubEmbeddingProvider:
+    """An in-process `EmbeddingProvider` backed by the model service's stub.
+
+    Satisfies `rag.domain.ports.EmbeddingProvider` without a socket, so the
+    ingestion tests — which are about parsing, chunking and the state machine —
+    do not require a separately started process to reach `READY`.
+
+    **Not a mock.** It delegates to `model_service.backend.StubBackend`, the
+    same real implementation of the inference contract that CI serves over HTTP
+    (docs/adr/0011): deterministic vectors derived from a hash, and a sparse
+    vector built from real token frequencies. What it skips is the network and
+    `HttpModelClient` — both of which are covered thoroughly elsewhere, by the
+    M4 unit tests over `MockTransport` and by an integration module that runs
+    the client against a live service over a real socket.
+
+    It reports `embedding_model="stub"`, which is stamped onto every chunk row
+    it produces, so a test asserting on that column can tell where the vectors
+    came from.
+    """
+
+    def __init__(self) -> None:
+        from model_service.backend import StubBackend
+
+        self._backend = StubBackend()
+
+    async def embed(self, texts: Sequence[str], *, mode: Any = None) -> list[Any]:
+        from rag.domain.embedding import Embedding, SparseVector
+
+        raw = self._backend.embed(list(texts), mode=str(mode or "passage"))
+        return [
+            Embedding(
+                dense=item.dense,
+                sparse=SparseVector(indices=item.sparse_indices, values=item.sparse_values),
+            )
+            for item in raw
+        ]
+
+    async def info(self) -> Any:
+        from rag.domain.embedding import ModelInfo
+
+        described = self._backend.info()
+        return ModelInfo(
+            embedding_model=described.embedding_model,
+            embedding_version=described.embedding_version,
+            dimensions=described.dimensions,
+            max_sequence_tokens=8192,
+            tokenizer_hash=described.tokenizer_hash,
+            reranker_model=described.reranker_model,
+        )
+
+    async def aclose(self) -> None:
+        """Nothing to close. Present so it is drop-in for `HttpModelClient`."""

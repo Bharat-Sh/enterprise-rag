@@ -4,12 +4,15 @@ A multi-tenant, production-shaped retrieval-augmented generation platform:
 documents in, grounded and cited answers out, with access control, evaluation,
 and observability treated as features rather than afterthoughts.
 
-> **Status: M4 — Ingestion and the model service.** PDF, DOCX, HTML, Markdown
+> **Status: M5 — Retrieval works end to end.** PDF, DOCX, HTML, Markdown
 > and plain text can be uploaded, stored, parsed, and chunked by a background
 > worker, behind an API where every endpoint authenticates and every query is
 > tenant-scoped. A separate GPU service serves BGE-M3 embeddings and
 > cross-encoder reranking over HTTP, so the API and worker stay CPU-only.
-> Retrieval — the part that connects the two — arrives in M5. Milestones below.
+> Documents are now embedded, indexed in Qdrant, and searchable through
+> `POST /api/v1/search`, with tenant and ACL constraints pushed *into* the
+> vector query. Hybrid retrieval and reranking follow in M6 and M7. Milestones
+> below.
 
 ---
 
@@ -213,6 +216,30 @@ accident says so in the database.
 
 ---
 
+## Retrieval
+
+`POST /api/v1/search` embeds the query, filters inside the vector index, and
+hydrates the results from Postgres ([ADR-0012](docs/adr/0012-vector-index-and-retrieval.md)).
+
+```
+query ──► model service ──► Qdrant (pre-filtered) ──► Postgres (re-checked)
+             embed              tenant + ACL              text + title
+```
+
+| Decision | Why |
+|---|---|
+| **The access check is a pre-filter** | It runs *inside* the vector query. Post-filtering corrupts recall — asking for the top 50 and discarding 40 leaves 10 results, not the true top 10 — and the vectors were already read before the check, so the disclosure has happened. |
+| **One filter builder, no caller-supplied filters** | Postgres has row-level security; a query that forgets its tenant scope finds zero rows. Qdrant has nothing equivalent — a forgotten tenant clause returns every tenant's vectors with a 200. So there is exactly one function that builds a filter and it always emits both clauses. |
+| **The index holds no text** | Results are hydrated from Postgres, which re-applies the same access filter under RLS. That makes index drift a recall bug rather than a disclosure: a stale point matches, no permitted row comes back, the result vanishes. |
+| **An ACL change rewrites the payload, not the vectors** | Permissions do not change a vector, only who may match it. A grant costs a payload write, not a GPU pass over the document. |
+| **Sparse vectors are written now, queried in M6** | A collection's vector configuration is fixed at creation and BGE-M3 produces both in one pass. Storing dense only would make hybrid retrieval a full re-embed of the corpus later. |
+| **`READY` means indexed** | The temporary `CHUNKING → READY` edge from M3 is gone. A document that reached `READY` without vectors would be invisible to retrieval while claiming to be searchable, with nothing raised anywhere. |
+
+Search is dense-only until M6. Reranking — the model service already serves it —
+arrives in M7.
+
+---
+
 ## Architecture
 
 ```
@@ -401,7 +428,7 @@ caching but not correctness).
 | M3a | Ingestion — upload, blob store, worker, chunking, state machine | **done** |
 | M3b | Parsers — PDF, DOCX, and hostile-input hardening | **done** |
 | M4 | Model service — BGE-M3 + reranker on GPU, batching | **done** |
-| M5 | Dense retrieval — Qdrant, ACL pre-filter, `/search` | |
+| M5 | Dense retrieval — Qdrant, ACL pre-filter, `/search` | **done** |
 | M6 | Hybrid retrieval — sparse vectors, reciprocal rank fusion | |
 | M7 | Reranking — cross-encoder, circuit breaker | |
 | M8 | Generation — LangGraph, streaming, validated citations | |

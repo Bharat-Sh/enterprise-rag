@@ -45,18 +45,22 @@ services:
       retries: 10
 
   qdrant:
-    # TODO(M5): pin to the version matching the qdrant-client we build against.
-    # A floating tag is tolerable only because nothing depends on it until M5.
-    image: qdrant/qdrant:latest
+    # Pinned in M5, as the previous TODO here required. The same tag is used by
+    # the CI service container, so "it works against the version we build
+    # against" is something the integration suite establishes rather than
+    # something a floating tag quietly changes underneath us.
+    image: qdrant/qdrant:v1.12.4
     restart: unless-stopped
     ports:
       - "6333:6333" # REST
       - "6334:6334" # gRPC
     volumes:
       - qdrant-data:/qdrant/storage
-    # No healthcheck: the image ships no shell, curl, or wget, so there is
-    # nothing to exec. Added in M5 alongside the client, which can probe it
-    # properly from the API side.
+    # Still no healthcheck: the image ships no shell, curl or wget, so there is
+    # nothing to exec. The API's `/ready` probes it instead, which is a better
+    # check anyway — it asserts the *collection* exists, and a Qdrant that is up
+    # but has lost its collection would pass a bare TCP check and fail every
+    # search.
 
   api:
     build:

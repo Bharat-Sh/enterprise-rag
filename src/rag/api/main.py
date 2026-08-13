@@ -29,6 +29,7 @@ from rag.adapters.blobs.filesystem import FilesystemBlobStore
 from rag.adapters.models import HttpModelClient
 from rag.adapters.parsers import build_registry
 from rag.adapters.ratelimit.inprocess import InProcessRateLimiter
+from rag.adapters.vectorstore import QdrantVectorStore
 from rag.api.errors import register_exception_handlers
 from rag.api.middleware import RequestContextMiddleware, TimingMiddleware
 from rag.api.middleware.body_limit import BodySizeLimitMiddleware
@@ -38,6 +39,7 @@ from rag.api.v1.routers import (
     collections,
     documents,
     health,
+    search,
     users,
     well_known,
 )
@@ -67,13 +69,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         M5  Qdrant client                      -> health.register("qdrant", ...)
         M9  Redis client                       -> health.register("redis", required=False)
 
-    The M4 client is marked **not required** for readiness. Retrieval needs it,
-    but M4 has no retrieval endpoint yet, and everything the API currently
-    serves — uploads, documents, collections, auth — works while the GPU box is
-    down. Pulling every API replica out of the load balancer because a model
-    service is restarting would convert a degraded feature into a total outage.
-    M6 flips this to required when there is an endpoint that cannot answer
-    without it.
+    **The model service and Qdrant are both registered as *not required*, and
+    that stays true now that `/search` exists.** The M4 note here said M5 would
+    flip them; on writing M5 that turned out to be wrong.
+
+    Readiness governs load-balancer membership for the *whole API*. If the GPU
+    box or the vector index is down, search cannot answer — but upload,
+    document management, collections and auth all still work. Marking either
+    required removes every replica from the load balancer, turning "search is
+    degraded" into "the product is down". It also buys nothing: every replica
+    shares one model service and one Qdrant, so there is no healthy replica to
+    fail over to. A 503 from `/search` is the honest, contained answer.
 
     The M2 resources register no readiness check on purpose. They have no
     network dependency and no failure mode after construction: a bad signing key
@@ -141,6 +147,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         required=False,
     )
 
+    # The vector index. `ensure_ready` creates the collection and its payload
+    # indexes if absent — done here, at startup, so a misconfigured or
+    # unreachable store fails where an operator is watching rather than on the
+    # first document a user uploads.
+    #
+    # Tolerated rather than fatal: a Qdrant that is down should leave the API
+    # up and reporting itself unready-for-search, not crash-looping. The
+    # readiness check below is what surfaces it.
+    vector_store = QdrantVectorStore(settings.qdrant)
+    app.state.vector_store = vector_store
+    try:
+        await vector_store.ensure_ready()
+    except Exception as exc:
+        _log.warning("startup.vector_store_unavailable", error=f"{type(exc).__name__}: {exc}")
+
+    app.state.health.register("qdrant", vector_store.ping, timeout_seconds=3.0, required=False)
+
     _log.info(
         "startup.complete",
         health_checks=list(app.state.health.names),
@@ -148,12 +171,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         signing_kid=keyring.signing_kid,
         rate_limiting=settings.rate_limit.enabled,
         model_service=settings.model_service.base_url,
+        qdrant=(
+            f"local:{settings.qdrant.local_path}"
+            if settings.qdrant.uses_local_mode
+            else settings.qdrant.url
+        ),
     )
     try:
         yield
     finally:
         # Runs on clean shutdown and on startup failure alike, so resource
         # teardown belongs here rather than after `yield` unguarded.
+        await vector_store.aclose()
         await model_client.aclose()
         await engine.dispose()
         _log.info("shutdown.complete")
@@ -209,6 +238,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(users.router, prefix=API_V1_PREFIX)
     app.include_router(collections.router, prefix=API_V1_PREFIX)
     app.include_router(documents.router, prefix=API_V1_PREFIX)
+    app.include_router(search.router, prefix=API_V1_PREFIX)
 
     return app
 

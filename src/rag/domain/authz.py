@@ -64,6 +64,14 @@ class Permission(StrEnum):
     #: Granting access to a document is a different power from uploading one.
     DOCUMENT_MANAGE_ACL = "document:manage_acl"
 
+    #: Querying the index. Separate from `DOCUMENT_READ` even though both are
+    #: viewer-level and both return document text, because they are different
+    #: powers over different cost: reading a document you already know the id of
+    #: is one row, while search embeds on a GPU and scans an index. When there
+    #: is a plan that includes reading but not searching — or a per-tenant
+    #: search quota — this is the row that expresses it.
+    SEARCH_QUERY = "search:query"
+
 
 #: Higher is more privileged. Spaced by ten so a role can be inserted between
 #: two existing ones without renumbering.
@@ -89,6 +97,10 @@ MINIMUM_ROLE: dict[Permission, Role] = {
     Permission.DOCUMENT_UPLOAD: Role.MEMBER,
     Permission.DOCUMENT_DELETE: Role.ADMIN,
     Permission.DOCUMENT_MANAGE_ACL: Role.ADMIN,
+    # Querying is the thing a viewer exists to do. The ACL pre-filter, not the
+    # role, decides *which* documents come back — a viewer with access to one
+    # collection searches that collection and nothing else.
+    Permission.SEARCH_QUERY: Role.VIEWER,
 }
 
 

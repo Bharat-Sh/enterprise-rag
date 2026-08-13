@@ -123,10 +123,46 @@ class QdrantSettings(BaseModel):
     collection: str = "rag_chunks"
     timeout_seconds: float = Field(default=10.0, gt=0)
 
+    #: Run the client's embedded local mode instead of connecting to a server,
+    #: storing at this path (or in memory when `":memory:"`).
+    #:
+    #: This exists because the primary development machine has no Docker
+    #: (CLAUDE.md), and it is honest about what it buys: filter *correctness* is
+    #: identical, so the isolation tests mean exactly what they mean against a
+    #: server. What it does not do is payload indexes — the client warns
+    #: "Payload indexes have no effect in the local Qdrant" — so every filter is
+    #: a full scan and nothing here says anything about performance. CI runs the
+    #: same tests against a real service container, which is where the indexes
+    #: are real.
+    local_path: str | None = None
+
+    #: Named vectors. Both are written from M5 even though only `dense` is
+    #: queried until M6, because BGE-M3 produces both in one forward pass and a
+    #: collection's vector configuration is fixed at creation. Adding `sparse`
+    #: later would mean a new collection and re-embedding the entire corpus, to
+    #: store something we already had and threw away.
+    dense_vector_name: str = "dense"
+    sparse_vector_name: str = "sparse"
+
+    #: Must match the embedding model's width. Verified against `/v1/info` at
+    #: startup rather than trusted: a collection created at the wrong size
+    #: rejects every insert, and the error surfaces on the first ingestion
+    #: rather than at boot.
+    vector_size: int = Field(default=1024, ge=1)
+
+    #: Points per upsert request. Bounds both the HTTP payload and the memory a
+    #: worker holds: 1024 floats per vector means a batch of 128 is roughly a
+    #: megabyte of dense data before sparse, JSON and overhead.
+    upsert_batch_size: int = Field(default=128, ge=1, le=1024)
+
     @property
     def url(self) -> str:
         """Base HTTP URL. Contains no credentials."""
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def uses_local_mode(self) -> bool:
+        return self.local_path is not None
 
 
 class SigningAlgorithm(StrEnum):
@@ -274,6 +310,13 @@ class IngestionSettings(BaseModel):
     #: Wall-clock ceiling on a single parse. A malformed file that sends a
     #: parser into a loop must lose its job, not its worker.
     parse_timeout_seconds: float = Field(default=120.0, gt=0)
+
+    #: Chunks embedded and indexed per round trip. Bounds worker memory: a
+    #: 2000-page PDF is on the order of 10k chunks, and holding every dense
+    #: vector at once would be ~80 MB before sparse weights. Kept at or below
+    #: `ModelServiceSettings.max_texts_per_request`, which splits anything
+    #: larger anyway — this is the knob that stops it having to.
+    embed_batch_size: int = Field(default=32, ge=1, le=512)
 
     # --- limits on hostile input (docs/adr/0010) --------------------------
     #
