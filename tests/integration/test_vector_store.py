@@ -22,6 +22,7 @@ from rag.domain.access import AccessFilter
 from rag.domain.embedding import Embedding, SparseVector
 from rag.domain.enums import Role
 from rag.domain.retrieval import VectorPoint
+from tests.integration.conftest import QDRANT_IS_SERVER
 
 if TYPE_CHECKING:
     from rag.adapters.vectorstore import QdrantVectorStore
@@ -286,3 +287,50 @@ class TestReadiness:
         await vector_store.ensure_ready()
 
         await vector_store.ping()
+
+
+class TestPayloadIndexesOnARealServer:
+    """The one property local mode cannot have, asserted where it can.
+
+    `ensure_ready` creates payload indexes on `tenant_id`, `acl_principals` and
+    `document_id`. Without them Qdrant evaluates every filter as a scan over the
+    whole collection — correct answers, and progressively slower as other
+    tenants' data grows, which is the worst shape of performance bug because it
+    only appears in production and only later.
+
+    Local mode ignores `create_payload_index` entirely and says so, so this can
+    only be checked against a server. It skips locally and **runs in CI**, which
+    is also what makes the service container demonstrably load-bearing rather
+    than something that might have failed to start without anyone noticing.
+    """
+
+    async def test_the_filter_fields_are_indexed(self, vector_store: QdrantVectorStore) -> None:
+        if not QDRANT_IS_SERVER:
+            pytest.skip("local mode ignores payload indexes; nothing to assert")
+
+        info = await vector_store._call("get_collection", collection_name=vector_store._collection)
+        indexed = set(info.payload_schema or {})
+
+        assert {"tenant_id", "acl_principals", "document_id"} <= indexed, (
+            f"filter fields are unindexed: {indexed}"
+        )
+
+    async def test_the_tenant_field_is_declared_a_tenant_key(
+        self, vector_store: QdrantVectorStore
+    ) -> None:
+        # `is_tenant=True` is Qdrant's multitenancy hint: it co-locates each
+        # tenant's points in storage, so a filtered search touches one tenant's
+        # segments instead of scanning across everyone's. Asserted separately
+        # because a plain keyword index would satisfy the test above while
+        # losing the property that makes multitenancy scale.
+        if not QDRANT_IS_SERVER:
+            pytest.skip("local mode ignores payload indexes; nothing to assert")
+
+        info = await vector_store._call("get_collection", collection_name=vector_store._collection)
+        schema = (info.payload_schema or {})["tenant_id"]
+        params = getattr(schema, "params", None)
+
+        assert params is not None, f"tenant_id has no index params: {schema}"
+        assert getattr(params, "is_tenant", False) is True, (
+            f"tenant_id is indexed but not as a tenant key: {params}"
+        )

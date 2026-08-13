@@ -155,6 +155,29 @@ jobs:
       #
       # Not a service container: the image would have to be built first, and
       # this is one Python process that starts in under a second.
+      # The vector store fixtures choose their backing by probing this port, and
+      # fall back to the client's embedded local mode when nothing answers. That
+      # fallback is right on a developer machine and wrong here: a service
+      # container that failed to start would leave the suite quietly testing
+      # local mode, green, with the payload indexes — the one thing only a
+      # server has — never exercised at all.
+      #
+      # So the port is waited on and its absence fails the build. The image
+      # ships no shell, so this cannot be a container healthcheck.
+      - name: Wait for Qdrant
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:6333/readyz > /dev/null 2>&1; then
+              echo "qdrant is ready"
+              curl -fsS http://127.0.0.1:6333/ | head -c 200
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Qdrant did not become ready within 30s. The integration"
+          echo "::error::suite would have silently fallen back to local mode."
+          exit 1
+
       # BGE-M3's vocabulary, so `BgeTokenCounter` is actually exercised here.
       # Without it those tests skip, and the class production is meant to use —
       # the one that decides whether a chunk fits the model's window — would be
